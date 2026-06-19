@@ -875,6 +875,66 @@ def run(args) -> None:
     if args.ema:
         ema = ExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
 
+    # --- Student distillation setup -------------------------------------------
+    student = None
+    student_optimizer = None
+    student_lr_scheduler = None
+    student_ema = None
+    student_checkpoint_handler = None
+    distill_loss_fn = None
+    rattle_fn = None
+    if getattr(args, "distill", False):
+        from functools import partial
+
+        from mace.modules.loss import DistillationLoss
+        from mace.tools.distill_utils import rattle_batch, resolve_student_config
+
+        teacher_config = extract_config_mace_model(model)
+        teacher_scale_shift = {
+            "atomic_inter_scale": teacher_config["atomic_inter_scale"],
+            "atomic_inter_shift": teacher_config["atomic_inter_shift"],
+        }
+        student_config = resolve_student_config(args, teacher_config, teacher_scale_shift)
+        student = modules.ScaleShiftMACE(**student_config).to(device)
+        logging.info(
+            f"Student model: {student_config.get('hidden_irreps')}, "
+            f"num_interactions={student_config.get('num_interactions')}, "
+            f"correlation={student_config.get('correlation')}, "
+            f"r_max={student_config.get('r_max')}"
+        )
+        student_optimizer = torch.optim.AdamW(
+            student.parameters(),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+        )
+        student_lr_scheduler = LRScheduler(student_optimizer, args)
+        student_ema = ExponentialMovingAverage(
+            student.parameters(), decay=args.ema_decay
+        )
+        distill_loss_fn = DistillationLoss(
+            energy_weight=args.distill_energy_weight,
+            forces_weight=args.distill_forces_weight,
+            stress_weight=args.distill_stress_weight,
+        )
+        student_checkpoint_handler = tools.CheckpointHandler(
+            directory=args.checkpoints_dir,
+            tag=tag + "_student",
+            keep=args.keep_checkpoints,
+            swa_start=None,
+        )
+        rattle_fn = partial(
+            rattle_batch,
+            rattle_std=args.distill_rattle_std,
+            strain_std=args.distill_strain_std,
+            n_augment=args.distill_augment_ratio,
+            device=device,
+        )
+        logging.info(
+            f"Distillation enabled: warmup={args.distill_warmup_epochs} epochs, "
+            f"augment_ratio={args.distill_augment_ratio}, sampler={args.distill_sampler}"
+        )
+    # --------------------------------------------------------------------------
+
     if args.lbfgs:
         logging.info("Switching optimizer to LBFGS")
         optimizer = LBFGS(model.parameters(),
@@ -965,6 +1025,15 @@ def run(args) -> None:
         plotter=plotter,
         train_sampler=train_sampler,
         rank=rank,
+        student=student,
+        student_loss_fn=distill_loss_fn,
+        student_optimizer=student_optimizer,
+        student_ema=student_ema,
+        student_lr_scheduler=student_lr_scheduler,
+        student_checkpoint_handler=student_checkpoint_handler,
+        distill_warmup_epochs=getattr(args, "distill_warmup_epochs", 5),
+        rattle_fn=rattle_fn,
+        augment_ratio=getattr(args, "distill_augment_ratio", 1),
     )
 
     logging.info("")
@@ -1119,6 +1188,17 @@ def run(args) -> None:
                     )
                 except Exception as e:  # pylint: disable=W0718
                     pass
+
+        # Export student model (EMA weights, after teacher export loop)
+        if student is not None and rank == 0 and not swa_eval:
+            student_path = Path(args.model_dir) / (args.name + "_student.model")
+            logging.info(f"Saving student model to {student_path}")
+            student_to_save = deepcopy(student)
+            if args.save_cpu:
+                student_to_save = student_to_save.to("cpu")
+            with student_ema.average_parameters():
+                torch.save(student_to_save, student_path)
+            logging.info(f"Student model saved to {student_path}")
 
         logging.info("Computing metrics for training, validation, and test sets")
         for param in model.parameters():
