@@ -230,12 +230,17 @@ def rattle_batch(
         attributes are shallow-copied from the originals.
     """
 
+    if n_augment < 1:
+        raise ValueError(f"n_augment must be >= 1, got {n_augment}")
+
     # Split the batch into individual Data objects.
     data_list = batch.to_data_list()
+    if not data_list:
+        return batch
 
     augmented: list = []
     for data in data_list:
-        pos = data.pos  # [n_atoms, 3]
+        pos = data.positions  # [n_atoms, 3]
         n_atoms = pos.shape[0]
 
         has_cell = hasattr(data, "cell") and data.cell is not None
@@ -254,7 +259,7 @@ def rattle_batch(
 
             # Apply: new_pos = pos @ (I + ε) + rattle
             new_pos = pos.to(device) @ I_plus_strain + rattle
-            aug.pos = new_pos.detach().requires_grad_(False)
+            aug.positions = new_pos.detach()
 
             # -- Cell update (if present) ------------------------------------
             if has_cell:
@@ -262,7 +267,16 @@ def rattle_batch(
                 orig_shape = cell.shape
                 cell_3x3 = cell.to(device).reshape(3, 3)
                 new_cell = (cell_3x3 @ I_plus_strain).reshape(orig_shape)
-                aug.cell = new_cell.detach().requires_grad_(False)
+                aug.cell = new_cell.detach()
+
+                # Recompute shifts: shifts = unit_shifts @ cell (real space).
+                # After straining the cell the stale shifts would corrupt
+                # every PBC edge vector in the model.
+                if hasattr(aug, "unit_shifts") and aug.unit_shifts is not None:
+                    new_cell_3x3 = new_cell.reshape(3, 3)
+                    aug.shifts = (
+                        aug.unit_shifts.to(device).float() @ new_cell_3x3.to(dtype=torch.float32)
+                    ).to(pos.dtype)
 
             augmented.append(aug)
 
