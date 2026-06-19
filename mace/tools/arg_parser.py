@@ -963,6 +963,95 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.99,
     )
+
+    # Distillation
+    parser.add_argument(
+        "--distill",
+        help="activate knowledge distillation of a smaller student model from the teacher",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--distill_size",
+        help="shortcut preset for student size: 'xs', 'small', 'medium'",
+        type=str,
+        choices=["xs", "small", "medium"],
+        default=None,
+    )
+    parser.add_argument(
+        "--distill_hidden_irreps",
+        help="explicit irreps string for student model (overrides --distill_size preset)",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--distill_num_interactions",
+        help="number of interaction blocks for student",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--distill_correlation",
+        help="correlation order for student",
+        type=int,
+        default=2,
+    )
+    parser.add_argument(
+        "--distill_r_max",
+        help="distance cutoff for student (in Ang); None inherits teacher r_max",
+        type=float,
+        default=None,
+    )
+    parser.add_argument(
+        "--distill_warmup_epochs",
+        help="number of epochs to wait before starting distillation (allow teacher to converge)",
+        type=int,
+        default=5,
+    )
+    parser.add_argument(
+        "--distill_energy_weight",
+        help="weight of energy loss in distillation",
+        type=float,
+        default=1.0,
+    )
+    parser.add_argument(
+        "--distill_forces_weight",
+        help="weight of forces loss in distillation",
+        type=float,
+        default=100.0,
+    )
+    parser.add_argument(
+        "--distill_stress_weight",
+        help="weight of stress/virials loss in distillation",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--distill_augment_ratio",
+        help="number of augmented configurations per labelled configuration in batch",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--distill_rattle_std",
+        help="standard deviation of random displacements for rattle augmentation (in Angstroms)",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--distill_strain_std",
+        help="standard deviation of random strain for rattle augmentation (fractional)",
+        type=float,
+        default=0.005,
+    )
+    parser.add_argument(
+        "--distill_sampler",
+        help="augmentation sampler strategy",
+        type=str,
+        choices=["rattle"],
+        default="rattle",
+    )
+
     parser.add_argument(
         "--max_num_epochs", help="Maximum number of epochs", type=int, default=2048
     )
