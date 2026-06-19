@@ -172,6 +172,16 @@ def train(
     distributed_model: Optional[DistributedDataParallel] = None,
     train_sampler: Optional[DistributedSampler] = None,
     rank: Optional[int] = 0,
+    *,
+    student: Optional[torch.nn.Module] = None,
+    student_loss_fn: Optional[torch.nn.Module] = None,
+    student_optimizer: Optional[torch.optim.Optimizer] = None,
+    student_ema: Optional[ExponentialMovingAverage] = None,
+    student_lr_scheduler: Optional[torch.optim.lr_scheduler.ExponentialLR] = None,
+    student_checkpoint_handler: Optional[CheckpointHandler] = None,
+    distill_warmup_epochs: int = 5,
+    rattle_fn=None,
+    augment_ratio: int = 1,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -207,12 +217,17 @@ def train(
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
     while epoch < max_num_epochs:
+        # Determine whether distillation is active this epoch (warmup gate)
+        distill_enabled = (student is not None) and (epoch >= distill_warmup_epochs)
+
         # LR scheduler and SWA update
         if swa is None or epoch < swa.start:
             if epoch > start_epoch:
                 lr_scheduler.step(
                     metrics=valid_loss
                 )  # Can break if exponential LR, TODO fix that!
+                if student_lr_scheduler is not None:
+                    student_lr_scheduler.step(metrics=valid_loss)
         else:
             if swa_start:
                 logging.info("Changing loss based on Stage Two Weights")
@@ -243,6 +258,13 @@ def train(
             distributed=distributed,
             distributed_model=distributed_model,
             rank=rank,
+            student=student,
+            student_loss_fn=student_loss_fn,
+            student_optimizer=student_optimizer,
+            student_ema=student_ema,
+            distill_enabled=distill_enabled,
+            rattle_fn=rattle_fn,
+            augment_ratio=augment_ratio,
         )
         if distributed:
             torch.distributed.barrier()
@@ -322,6 +344,20 @@ def train(
                                 epochs=epoch,
                                 keep_last=True,
                             )
+                        if student_checkpoint_handler is not None:
+                            student_param_context = (
+                                student_ema.average_parameters()
+                                if student_ema is not None
+                                else nullcontext()
+                            )
+                            with student_param_context:
+                                student_checkpoint_handler.save(
+                                    state=CheckpointState(
+                                        student, student_optimizer, student_lr_scheduler
+                                    ),
+                                    epochs=epoch,
+                                    keep_last=True,
+                                )
                 else:
                     lowest_loss = valid_loss
                     patience_counter = 0
@@ -335,6 +371,20 @@ def train(
                             keep_last=keep_last,
                         )
                         keep_last = False or save_all_checkpoints
+                    if student_checkpoint_handler is not None:
+                        student_param_context = (
+                            student_ema.average_parameters()
+                            if student_ema is not None
+                            else nullcontext()
+                        )
+                        with student_param_context:
+                            student_checkpoint_handler.save(
+                                state=CheckpointState(
+                                    student, student_optimizer, student_lr_scheduler
+                                ),
+                                epochs=epoch,
+                                keep_last=keep_last,
+                            )
         if distributed:
             torch.distributed.barrier()
         if exit_now is not None:
@@ -361,10 +411,23 @@ def train_one_epoch(
     distributed: bool,
     distributed_model: Optional[DistributedDataParallel] = None,
     rank: Optional[int] = 0,
+    *,
+    student: Optional[torch.nn.Module] = None,
+    student_loss_fn: Optional[torch.nn.Module] = None,
+    student_optimizer: Optional[torch.optim.Optimizer] = None,
+    student_ema: Optional[ExponentialMovingAverage] = None,
+    distill_enabled: bool = False,
+    rattle_fn=None,
+    augment_ratio: int = 1,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
     if isinstance(optimizer, LBFGS):
+        if distill_enabled:
+            logging.warning(
+                "Distillation is not supported with LBFGS optimizer. "
+                "Student will not be updated this epoch."
+            )
         _, opt_metrics = take_step_lbfgs(
             model=model_to_train,
             loss_fn=loss_fn,
@@ -392,6 +455,13 @@ def train_one_epoch(
                 output_args=output_args,
                 max_grad_norm=max_grad_norm,
                 device=device,
+                student=student,
+                student_loss_fn=student_loss_fn,
+                student_optimizer=student_optimizer,
+                student_ema=student_ema,
+                distill_enabled=distill_enabled,
+                rattle_fn=rattle_fn,
+                augment_ratio=augment_ratio,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -408,6 +478,14 @@ def take_step(
     output_args: Dict[str, bool],
     max_grad_norm: Optional[float],
     device: torch.device,
+    *,
+    student: Optional[torch.nn.Module] = None,
+    student_loss_fn: Optional[torch.nn.Module] = None,
+    student_optimizer: Optional[torch.optim.Optimizer] = None,
+    student_ema: Optional[ExponentialMovingAverage] = None,
+    distill_enabled: bool = False,
+    rattle_fn=None,
+    augment_ratio: int = 1,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -439,6 +517,60 @@ def take_step(
         "loss": to_numpy(loss),
         "time": time.time() - start_time,
     }
+
+    # --- Student distillation block (passenger: never touches the teacher graph) ---
+    if distill_enabled and student is not None:
+        # Generate augmented configurations labelled cheaply by the EMA teacher
+        aug_batch = rattle_fn(batch)
+
+        # Run EMA teacher on augmented batch — no gradient, EMA weights
+        with torch.no_grad():
+            if ema is not None:
+                with ema.average_parameters():
+                    teacher_out = model(
+                        aug_batch.to(device).to_dict(),
+                        training=False,
+                        compute_force=True,
+                        compute_virials=False,
+                        compute_stress=(student_loss_fn.stress_weight.item() > 0),
+                    )
+            else:
+                teacher_out = model(
+                    aug_batch.to(device).to_dict(),
+                    training=False,
+                    compute_force=True,
+                    compute_virials=False,
+                    compute_stress=(student_loss_fn.stress_weight.item() > 0),
+                )
+
+        # Detach all teacher outputs (belt-and-suspenders — no_grad is enough but detach is explicit)
+        teacher_out = {
+            k: v.detach() if isinstance(v, torch.Tensor) else v
+            for k, v in teacher_out.items()
+        }
+
+        # Student forward
+        student_optimizer.zero_grad()
+        student_out = student(
+            aug_batch.to(device).to_dict(),
+            training=True,
+            compute_force=True,
+            compute_virials=False,
+            compute_stress=(student_loss_fn.stress_weight.item() > 0),
+        )
+
+        s_loss, s_loss_dict = student_loss_fn(student_out, teacher_out, aug_batch.to(device))
+        s_loss.backward()
+        if max_grad_norm:
+            torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
+        student_optimizer.step()
+        if student_ema is not None:
+            student_ema.update()
+
+        # Merge student loss dict into the return loss_dict under "student_" prefix
+        for k, v in s_loss_dict.items():
+            loss_dict[k] = v
+    # --- End student distillation block ---
 
     return loss, loss_dict
 
