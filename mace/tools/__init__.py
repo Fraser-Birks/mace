@@ -1,4 +1,5 @@
 from .arg_parser import build_default_arg_parser, build_preprocess_arg_parser
+from .distill_utils import STUDENT_PRESETS, rattle_batch, resolve_student_config
 from .arg_parser_tools import check_args
 from .cg import U_matrix_real
 from .checkpoint import CheckpointHandler, CheckpointIO, CheckpointState
@@ -34,6 +35,9 @@ from .utils import (
 )
 
 __all__ = [
+    "STUDENT_PRESETS",
+    "resolve_student_config",
+    "rattle_batch",
     "TensorDict",
     "AtomicNumberTable",
     "atomic_numbers_to_indices",

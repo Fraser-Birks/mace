@@ -986,15 +986,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--distill_num_interactions",
-        help="number of interaction blocks for student",
+        help="number of interaction blocks for student (None inherits from preset or teacher)",
         type=int,
-        default=1,
+        default=None,
     )
     parser.add_argument(
         "--distill_correlation",
-        help="correlation order for student",
+        help="correlation order for student (None inherits from preset or teacher)",
         type=int,
-        default=2,
+        default=None,
     )
     parser.add_argument(
         "--distill_r_max",
