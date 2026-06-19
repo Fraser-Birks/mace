@@ -698,9 +698,9 @@ class DistillationLoss(torch.nn.Module):
         f_loss = reduce_loss(raw_forces_loss, ddp=False)
 
         # --- Stress loss: per-structure MSE (optional) --------------------------
-        s_loss = torch.zeros(1, dtype=e_loss.dtype, device=e_loss.device).squeeze()
+        s_loss = torch.zeros((), dtype=e_loss.dtype, device=e_loss.device)
         stress_computed = (
-            self.stress_weight > 0
+            self.stress_weight.item() > 0
             and student_pred.get("stress") is not None
             and teacher_pred.get("stress") is not None
         )
@@ -717,10 +717,10 @@ class DistillationLoss(torch.nn.Module):
             + self.stress_weight * s_loss
         )
 
-        loss_dict: Dict[str, torch.Tensor] = {
-            "distill_energy": e_loss.detach(),
-            "distill_forces": f_loss.detach(),
-            "distill_stress": s_loss.detach(),
+        loss_dict: Dict[str, float] = {
+            "distill_energy": e_loss.item(),
+            "distill_forces": f_loss.item(),
+            "distill_stress": s_loss.item(),
         }
 
         return total_loss, loss_dict
@@ -728,7 +728,7 @@ class DistillationLoss(torch.nn.Module):
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}("
-            f"energy_weight={self.energy_weight:.3f}, "
-            f"forces_weight={self.forces_weight:.3f}, "
-            f"stress_weight={self.stress_weight:.3f})"
+            f"energy_weight={self.energy_weight.item():.3f}, "
+            f"forces_weight={self.forces_weight.item():.3f}, "
+            f"stress_weight={self.stress_weight.item():.3f})"
         )
