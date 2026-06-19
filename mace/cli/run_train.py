@@ -886,6 +886,7 @@ def run(args) -> None:
     if getattr(args, "distill", False):
         from functools import partial
 
+        from mace.modules import ScaleShiftMACE as _ScaleShiftMACE
         from mace.modules.loss import DistillationLoss
         from mace.tools.distill_utils import rattle_batch, resolve_student_config
 
@@ -895,7 +896,7 @@ def run(args) -> None:
             "atomic_inter_shift": teacher_config["atomic_inter_shift"],
         }
         student_config = resolve_student_config(args, teacher_config, teacher_scale_shift)
-        student = modules.ScaleShiftMACE(**student_config).to(device)
+        student = _ScaleShiftMACE(**student_config).to(device)
         logging.info(
             f"Student model: {student_config.get('hidden_irreps')}, "
             f"num_interactions={student_config.get('num_interactions')}, "

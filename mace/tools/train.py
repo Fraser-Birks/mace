@@ -523,18 +523,13 @@ def take_step(
         # Generate augmented configurations labelled cheaply by the EMA teacher
         aug_batch = rattle_fn(batch)
 
-        # Run EMA teacher on augmented batch — no gradient, EMA weights
-        with torch.no_grad():
-            if ema is not None:
-                with ema.average_parameters():
-                    teacher_out = model(
-                        aug_batch.to(device).to_dict(),
-                        training=False,
-                        compute_force=True,
-                        compute_virials=False,
-                        compute_stress=(student_loss_fn.stress_weight.item() > 0),
-                    )
-            else:
+        # Run EMA teacher on augmented batch.
+        # Forces are computed via autograd.grad(energy, positions), so we cannot
+        # use torch.no_grad() here (it prevents graph construction for positions).
+        # Instead we detach all outputs immediately after, which breaks the graph
+        # before the student loss and ensures no gradient flows to teacher params.
+        if ema is not None:
+            with ema.average_parameters():
                 teacher_out = model(
                     aug_batch.to(device).to_dict(),
                     training=False,
@@ -542,8 +537,17 @@ def take_step(
                     compute_virials=False,
                     compute_stress=(student_loss_fn.stress_weight.item() > 0),
                 )
+        else:
+            teacher_out = model(
+                aug_batch.to(device).to_dict(),
+                training=False,
+                compute_force=True,
+                compute_virials=False,
+                compute_stress=(student_loss_fn.stress_weight.item() > 0),
+            )
 
-        # Detach all teacher outputs (belt-and-suspenders — no_grad is enough but detach is explicit)
+        # Detach all teacher outputs — breaks the graph so student.backward() cannot
+        # reach teacher parameters.
         teacher_out = {
             k: v.detach() if isinstance(v, torch.Tensor) else v
             for k, v in teacher_out.items()

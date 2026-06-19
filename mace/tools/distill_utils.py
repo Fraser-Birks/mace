@@ -24,7 +24,6 @@ rattle_batch(batch, rattle_std, strain_std, n_augment, device) -> Batch
 """
 
 import logging
-from copy import deepcopy
 from typing import Any, Dict
 
 import torch
@@ -196,89 +195,95 @@ def rattle_batch(
     n_augment: int,
     device: torch.device,
 ) -> "torch_geometric.Batch":
-    """Generate perturbed copies of each structure in *batch*.
+    """Return one rattled/strained copy of *batch*, operating on batched tensors.
 
-    For every structure in *batch* this function creates *n_augment* rattled
-    copies, each with:
+    Avoids ``to_data_list()`` to sidestep the ``AtomicData`` required-argument
+    constructor issue in MACE's custom torch_geometric.  Uses ``batch.clone()``
+    instead.
 
-    * Independent per-atom Gaussian position displacements:
-      ``Δpos ~ N(0, rattle_std)``.
-    * A per-copy symmetric 3×3 strain matrix ``ε ~ N(0, strain_std)``
-      applied as ``pos_new = pos @ (I + ε)`` and
-      ``cell_new = cell @ (I + ε)`` (if ``cell`` is present).
+    For each of *n_augment* augmented copies:
+
+    * Per-atom Gaussian position displacements ~ N(0, rattle_std).
+    * Per-structure symmetric 3×3 strain ~ N(0, strain_std) applied as
+      ``pos_new = pos @ (I + ε)`` and ``cell_new = cell @ (I + ε)``.
+      ``shifts`` is recomputed from ``unit_shifts`` and the new cell.
+
+    When ``n_augment > 1``, a single randomly chosen copy is returned (so the
+    output batch has the same number of graphs as the input).
 
     Parameters
     ----------
     batch:
-        Input ``torch_geometric.Batch``.  Expected to have at least
-        ``pos``, ``batch`` (node→graph map), and ``ptr`` attributes.
-        ``cell`` (shape ``[n_graphs, 3, 3]``) is updated when present.
+        Input MACE ``torch_geometric.Batch`` with ``positions``, ``batch``
+        (node→graph map), ``cell`` (``[n_graphs*3, 3]`` — PyG format), and
+        ``unit_shifts``.
     rattle_std:
         Standard deviation (Å) for per-atom position noise.
     strain_std:
         Standard deviation for the symmetric strain matrix entries.
     n_augment:
-        Number of augmented copies per input structure.
+        Number of augmented copies to generate (one is returned).
     device:
         Torch device on which to generate random tensors.
 
     Returns
     -------
     torch_geometric.Batch
-        A new Batch containing ``n_structures * n_augment`` structures with
-        perturbed positions (and cells).  All other per-node/per-edge
-        attributes are shallow-copied from the originals.
+        A cloned batch with perturbed positions (and cells/shifts).
     """
-
     if n_augment < 1:
         raise ValueError(f"n_augment must be >= 1, got {n_augment}")
 
-    # Split the batch into individual Data objects.
-    data_list = batch.to_data_list()
-    if not data_list:
-        return batch
+    n_graphs = batch.num_graphs
+    pos = batch.positions.to(device)      # [n_atoms, 3]
+    dtype = pos.dtype
+    graph_idx = batch.batch.to(device)    # [n_atoms] node→graph map
 
-    augmented: list = []
-    for data in data_list:
-        pos = data.positions  # [n_atoms, 3]
-        n_atoms = pos.shape[0]
+    # When n_augment > 1 pick one copy at random; caller can call multiple times.
+    chosen = int(torch.randint(n_augment, (1,)).item()) if n_augment > 1 else 0
 
-        has_cell = hasattr(data, "cell") and data.cell is not None
+    result = None
+    for copy_idx in range(n_augment):
+        # Generate per-structure symmetric strain (always, to keep RNG consistent)
+        A = torch.randn(n_graphs, 3, 3, dtype=dtype, device=device) * strain_std
+        strain = (A + A.transpose(-1, -2)) * 0.5             # [n_graphs, 3, 3]
+        I = torch.eye(3, dtype=dtype, device=device).unsqueeze(0)
+        I_plus_strain = I + strain                            # [n_graphs, 3, 3]
 
-        for _ in range(n_augment):
-            aug = deepcopy(data)
+        if copy_idx != chosen:
+            continue  # discard non-chosen copy; RNG already advanced above
 
-            # -- Symmetric strain -------------------------------------------
-            # Sample a full 3×3 matrix and symmetrise: ε = (A + Aᵀ) / 2
-            A = torch.randn(3, 3, dtype=pos.dtype, device=device) * strain_std
-            strain = (A + A.T) * 0.5  # [3, 3]
-            I_plus_strain = torch.eye(3, dtype=pos.dtype, device=device) + strain
+        aug = batch.clone()
 
-            # -- Position perturbation ---------------------------------------
-            rattle = torch.randn(n_atoms, 3, dtype=pos.dtype, device=device) * rattle_std
+        # Per-atom rattle
+        rattle = torch.randn_like(pos) * rattle_std
 
-            # Apply: new_pos = pos @ (I + ε) + rattle
-            new_pos = pos.to(device) @ I_plus_strain + rattle
-            aug.positions = new_pos.detach()
+        # Apply per-structure strain to each atom: I_plus_strain[graph_idx] @ pos
+        Ipe_per_atom = I_plus_strain[graph_idx]               # [n_atoms, 3, 3]
+        new_pos = torch.bmm(pos.unsqueeze(1), Ipe_per_atom).squeeze(1) + rattle
+        aug.positions = new_pos.detach()
 
-            # -- Cell update (if present) ------------------------------------
-            if has_cell:
-                cell = data.cell  # [1, 3, 3] or [3, 3]
-                orig_shape = cell.shape
-                cell_3x3 = cell.to(device).reshape(3, 3)
-                new_cell = (cell_3x3 @ I_plus_strain).reshape(orig_shape)
-                aug.cell = new_cell.detach()
+        # Cell and shifts
+        # batch.cell is stored as [n_graphs*3, 3] (PyG concatenates along dim 0)
+        has_cell = hasattr(batch, "cell") and batch.cell is not None
+        if has_cell:
+            cell = batch.cell.to(device).reshape(n_graphs, 3, 3)  # [n_graphs, 3, 3]
+            new_cell = torch.bmm(cell, I_plus_strain)              # [n_graphs, 3, 3]
+            aug.cell = new_cell.reshape(-1, 3).detach()            # [n_graphs*3, 3]
 
-                # Recompute shifts: shifts = unit_shifts @ cell (real space).
-                # After straining the cell the stale shifts would corrupt
-                # every PBC edge vector in the model.
-                if hasattr(aug, "unit_shifts") and aug.unit_shifts is not None:
-                    new_cell_3x3 = new_cell.reshape(3, 3)
-                    aug.shifts = (
-                        aug.unit_shifts.to(device).float() @ new_cell_3x3.to(dtype=torch.float32)
-                    ).to(pos.dtype)
+            has_unit_shifts = (
+                hasattr(batch, "unit_shifts") and batch.unit_shifts is not None
+            )
+            if has_unit_shifts:
+                unit_shifts = batch.unit_shifts.to(device)   # [n_edges, 3]
+                edge_graph = graph_idx[batch.edge_index[0]]  # [n_edges]
+                new_cell_per_edge = new_cell[edge_graph]     # [n_edges, 3, 3]
+                new_shifts = torch.bmm(
+                    unit_shifts.float().unsqueeze(1),
+                    new_cell_per_edge.float(),
+                ).squeeze(1).to(dtype)
+                aug.shifts = new_shifts.detach()
 
-            augmented.append(aug)
+        result = aug
 
-    new_batch = torch_geometric.Batch.from_data_list(augmented)
-    return new_batch
+    return result
