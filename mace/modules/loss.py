@@ -4,7 +4,7 @@
 # This program is distributed under the MIT License (see MIT.md)
 ###########################################################################################
 
-from typing import Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -622,4 +622,113 @@ class WeightedEnergyForcesL1L2Loss(torch.nn.Module):
         return (
             f"{self.__class__.__name__}(energy_weight={self.energy_weight:.3f}, "
             f"forces_weight={self.forces_weight:.3f})"
+        )
+
+
+# ------------------------------------------------------------------------------
+# Distillation Loss: student vs. detached EMA-teacher predictions
+# ------------------------------------------------------------------------------
+
+
+class DistillationLoss(torch.nn.Module):
+    """Response-based distillation loss matching student to detached EMA-teacher.
+
+    Compares per-atom energies, forces, and (optionally) stresses between
+    the student and a detached EMA-teacher prediction on the same batch.
+    teacher_pred must be detached *before* being passed in — this class
+    does NOT call .detach() internally, so that the caller controls the
+    exact detachment point.
+
+    Args:
+        energy_weight: Weight for per-atom energy MSE term.
+        forces_weight: Weight for per-atom-component forces MSE term.
+        stress_weight: Weight for per-structure stress MSE term (0 disables).
+    """
+
+    def __init__(
+        self,
+        energy_weight: float = 1.0,
+        forces_weight: float = 10.0,
+        stress_weight: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer(
+            "energy_weight",
+            torch.tensor(energy_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "forces_weight",
+            torch.tensor(forces_weight, dtype=torch.get_default_dtype()),
+        )
+        self.register_buffer(
+            "stress_weight",
+            torch.tensor(stress_weight, dtype=torch.get_default_dtype()),
+        )
+
+    def forward(
+        self,
+        student_pred: Dict[str, torch.Tensor],
+        teacher_pred: Dict[str, torch.Tensor],
+        batch: Any,  # torch_geometric.Batch
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute distillation loss between student and (already-detached) teacher.
+
+        Args:
+            student_pred: Dict with keys "energy", "forces", and optionally "stress".
+            teacher_pred: Dict with same keys; all tensors must already be detached.
+            batch: The torch_geometric Batch object (needs batch.ptr for atom counts).
+
+        Returns:
+            (total_loss, loss_dict) where loss_dict contains scalar float values
+            for "distill_energy", "distill_forces", "distill_stress".
+        """
+        # --- Energy loss: per-atom MSE, averaged over structures ---------------
+        # Shape: [n_graphs]
+        num_atoms = (batch.ptr[1:] - batch.ptr[:-1]).to(
+            dtype=student_pred["energy"].dtype
+        )
+        raw_energy_loss = torch.square(
+            (student_pred["energy"] - teacher_pred["energy"]) / num_atoms
+        )
+        e_loss = reduce_loss(raw_energy_loss, ddp=False)
+
+        # --- Forces loss: per-atom-component MSE --------------------------------
+        # Shape: [n_atoms, 3]
+        raw_forces_loss = torch.square(student_pred["forces"] - teacher_pred["forces"])
+        f_loss = reduce_loss(raw_forces_loss, ddp=False)
+
+        # --- Stress loss: per-structure MSE (optional) --------------------------
+        s_loss = torch.zeros(1, dtype=e_loss.dtype, device=e_loss.device).squeeze()
+        stress_computed = (
+            self.stress_weight > 0
+            and student_pred.get("stress") is not None
+            and teacher_pred.get("stress") is not None
+        )
+        if stress_computed:
+            # Shape: [n_graphs, 3, 3]
+            raw_stress_loss = torch.square(
+                student_pred["stress"] - teacher_pred["stress"]
+            )
+            s_loss = reduce_loss(raw_stress_loss, ddp=False)
+
+        total_loss = (
+            self.energy_weight * e_loss
+            + self.forces_weight * f_loss
+            + self.stress_weight * s_loss
+        )
+
+        loss_dict: Dict[str, torch.Tensor] = {
+            "distill_energy": e_loss.detach(),
+            "distill_forces": f_loss.detach(),
+            "distill_stress": s_loss.detach(),
+        }
+
+        return total_loss, loss_dict
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"energy_weight={self.energy_weight:.3f}, "
+            f"forces_weight={self.forces_weight:.3f}, "
+            f"stress_weight={self.stress_weight:.3f})"
         )
