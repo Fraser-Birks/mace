@@ -1194,11 +1194,13 @@ def run(args) -> None:
         if student is not None and rank == 0 and not swa_eval:
             student_path = Path(args.model_dir) / (args.name + "_student.model")
             logging.info(f"Saving student model to {student_path}")
-            student_to_save = deepcopy(student)
+            # deepcopy must happen INSIDE average_parameters() so the copy
+            # captures the EMA weights, not the live weights.
+            with student_ema.average_parameters():
+                student_to_save = deepcopy(student)
             if args.save_cpu:
                 student_to_save = student_to_save.to("cpu")
-            with student_ema.average_parameters():
-                torch.save(student_to_save, student_path)
+            torch.save(student_to_save, student_path)
             logging.info(f"Student model saved to {student_path}")
 
         logging.info("Computing metrics for training, validation, and test sets")

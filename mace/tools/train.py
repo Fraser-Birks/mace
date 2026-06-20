@@ -571,7 +571,7 @@ def take_step(
         if student_ema is not None:
             student_ema.update()
 
-        # Merge student loss dict into the return loss_dict under "student_" prefix
+        # Merge student loss dict (keys: distill_energy, distill_forces, distill_stress)
         for k, v in s_loss_dict.items():
             loss_dict[k] = v
     # --- End student distillation block ---
