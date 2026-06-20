@@ -904,9 +904,14 @@ def run(args) -> None:
             f"correlation={student_config.get('correlation')}, "
             f"r_max={student_config.get('r_max')}"
         )
+        _distill_lr = getattr(args, "distill_lr", 1e-2)
+        logging.info(
+            f"[Distillation] Student optimizer: AdamW lr={_distill_lr} "
+            f"(teacher lr={args.lr}; use --distill_lr to tune separately)"
+        )
         student_optimizer = torch.optim.AdamW(
             student.parameters(),
-            lr=args.lr,
+            lr=_distill_lr,
             weight_decay=args.weight_decay,
         )
         student_lr_scheduler = LRScheduler(student_optimizer, args)
@@ -936,11 +941,12 @@ def run(args) -> None:
                 forces_weight=args.swa_forces_weight,
                 stress_weight=args.distill_stress_weight,
             )
+            _distill_swa_lr = getattr(args, "distill_swa_lr", 5e-3)
             student_swa = _SWAContainer(
                 model=_AveragedModel(student),
                 scheduler=_SWALR(
                     optimizer=student_optimizer,
-                    swa_lr=args.swa_lr,
+                    swa_lr=_distill_swa_lr,
                     anneal_epochs=1,
                     anneal_strategy="linear",
                 ),
@@ -951,7 +957,8 @@ def run(args) -> None:
                 f"[Distillation] Stage Two enabled: distillation loss switches at "
                 f"epoch {swa.start} "
                 f"(energy_weight={args.swa_energy_weight}, "
-                f"forces_weight={args.swa_forces_weight})"
+                f"forces_weight={args.swa_forces_weight}, "
+                f"student_swa_lr={_distill_swa_lr})"
             )
         rattle_fn = partial(
             rattle_batch,
@@ -980,9 +987,20 @@ def run(args) -> None:
 
             logging.info(f"[Distillation] Augmented configs will be written to {_dump_path}")
 
+        _n_student_heads = len(heads)
+        if _n_student_heads > 1:
+            _head_names = ", ".join(heads.keys())
+            logging.info(
+                f"[Distillation] Multihead fine-tuning detected ({_n_student_heads} heads: "
+                f"{_head_names}). Student distils from ALL heads via EMA teacher "
+                "pseudo-labels. Validation RMSE for replay/foundation heads will be high "
+                "early in training — the student has not seen DFT labels for those heads, "
+                "only teacher pseudo-labels. Focus on your target (new-data) head."
+            )
         logging.info(
             f"Distillation enabled: warmup={args.distill_warmup_epochs} epochs, "
-            f"augment_ratio={args.distill_augment_ratio}, sampler={args.distill_sampler}"
+            f"augment_ratio={args.distill_augment_ratio}, sampler={args.distill_sampler}, "
+            f"student_lr={getattr(args, 'distill_lr', 1e-2)}"
         )
     else:
         dump_augmented_fn = None
@@ -1087,6 +1105,8 @@ def run(args) -> None:
         student_checkpoint_handler=student_checkpoint_handler,
         student_swa=student_swa,
         distill_warmup_epochs=getattr(args, "distill_warmup_epochs", 5),
+        distill_debug=getattr(args, "distill_debug", False),
+        distill_num_heads=len(heads) if getattr(args, "distill", False) else 1,
         rattle_fn=rattle_fn,
         augment_ratio=getattr(args, "distill_augment_ratio", 1),
         dump_augmented_fn=dump_augmented_fn,

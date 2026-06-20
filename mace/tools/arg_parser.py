@@ -1060,6 +1060,37 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
     )
+    parser.add_argument(
+        "--distill_lr",
+        help=(
+            "initial learning rate for the student optimizer (Stage One). "
+            "Defaults to 1e-2, which is appropriate for training a student from scratch. "
+            "Do NOT set this to the teacher's fine-tuning lr — the student trains "
+            "from random init and needs a much larger lr."
+        ),
+        type=float,
+        default=1e-2,
+    )
+    parser.add_argument(
+        "--distill_swa_lr",
+        help=(
+            "learning rate for the student optimizer in Stage Two (SWA phase). "
+            "Cosine-annealed via SWALR, analogous to --swa_lr for the teacher."
+        ),
+        type=float,
+        default=5e-3,
+    )
+    parser.add_argument(
+        "--distill_debug",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable verbose per-step distillation timing logs. "
+            "Prints per-phase timings (teacher DFT, rattle, EMA teacher fwd, "
+            "student fwd/bwd) and an epoch summary for each training epoch. "
+            "Useful for diagnosing bottlenecks or hangs."
+        ),
+    )
 
     parser.add_argument(
         "--max_num_epochs", help="Maximum number of epochs", type=int, default=2048

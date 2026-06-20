@@ -184,6 +184,8 @@ def train(
     rattle_fn=None,
     augment_ratio: int = 1,
     dump_augmented_fn=None,
+    distill_debug: bool = False,
+    distill_num_heads: int = 1,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -210,6 +212,17 @@ def train(
             )
         else:
             logging.info("  Student training active from epoch 0 (no warmup)")
+        if distill_num_heads > 1:
+            logging.info(
+                f"  Multihead mode: student has {distill_num_heads} heads. "
+                "Student trains via EMA teacher pseudo-labels on ALL heads. "
+                "Validation RMSE for non-new heads compares against DFT labels "
+                "that the student was NOT directly trained on — high values are expected."
+            )
+        if distill_debug:
+            logging.info(
+                "  Debug mode ON — per-step timings will be logged for every batch."
+            )
         logging.info("=========================================")
         logging.info("")
     epoch = start_epoch
@@ -295,6 +308,7 @@ def train(
             rattle_fn=rattle_fn,
             augment_ratio=augment_ratio,
             dump_augmented_fn=dump_augmented_fn,
+            distill_debug=distill_debug,
         )
         if distributed:
             torch.distributed.barrier()
@@ -350,6 +364,12 @@ def train(
 
             # Student validation against DFT labels (only when distillation is active)
             if student is not None and distill_enabled and rank == 0:
+                if distill_debug:
+                    _t_sval = time.time()
+                    logging.info(
+                        f"[Distill DEBUG E{epoch}] Student validation start "
+                        f"({len(valid_loaders)} loader(s))"
+                    )
                 student_param_ctx = (
                     student_ema.average_parameters()
                     if student_ema is not None
@@ -376,6 +396,11 @@ def train(
                         s_metrics["epoch"] = epoch
                         s_metrics["head"] = valid_loader_name
                         logger.log(s_metrics)
+                if distill_debug:
+                    logging.info(
+                        f"[Distill DEBUG E{epoch}] Student validation done "
+                        f"({time.time()-_t_sval:.2f}s)"
+                    )
 
             if rank == 0:
                 if valid_loss >= lowest_loss:
@@ -480,6 +505,7 @@ def train_one_epoch(
     rattle_fn=None,
     augment_ratio: int = 1,
     dump_augmented_fn=None,
+    distill_debug: bool = False,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -506,7 +532,20 @@ def train_one_epoch(
         if rank == 0:
             logger.log(opt_metrics)
     else:
-        for batch in data_loader:
+        if distill_debug:
+            _dbg_epoch_start = time.time()
+            _dbg_step_data: List[Dict[str, Any]] = []
+            if distill_enabled:
+                logging.info(
+                    f"[Distill DEBUG E{epoch}] Epoch start — distillation ACTIVE"
+                )
+            else:
+                logging.info(
+                    f"[Distill DEBUG E{epoch}] Epoch start — distillation WARMUP "
+                    f"(student inactive)"
+                )
+
+        for _step_idx, batch in enumerate(data_loader):
             _, opt_metrics = take_step(
                 model=model_to_train,
                 loss_fn=loss_fn,
@@ -524,11 +563,78 @@ def train_one_epoch(
                 rattle_fn=rattle_fn,
                 augment_ratio=augment_ratio,
                 dump_augmented_fn=dump_augmented_fn,
+                distill_debug=distill_debug,
             )
+
+            # --- Verbose debug logging ---
+            if distill_debug and rank == 0:
+                if distill_enabled and "_dbg_t_rattle_ms" in opt_metrics:
+                    # First step of epoch: log aug batch stats to sanity-check teacher
+                    if _step_idx == 0:
+                        e_min = opt_metrics.get("_dbg_teacher_e_min")
+                        e_max = opt_metrics.get("_dbg_teacher_e_max")
+                        f_rms = opt_metrics.get("_dbg_teacher_f_rms")
+                        stats = (
+                            f"{opt_metrics['_dbg_n_aug_graphs']} graphs / "
+                            f"{opt_metrics['_dbg_n_aug_atoms']} atoms"
+                        )
+                        if e_min is not None:
+                            stats += f" | teacher E∈[{e_min:.3f}, {e_max:.3f}] eV"
+                        if f_rms is not None:
+                            stats += f" | teacher F_rms={f_rms:.3f} eV/Å"
+                        logging.info(
+                            f"[Distill DEBUG E{epoch} step 0 aug] {stats}"
+                        )
+                    # Per-step timing one-liner
+                    logging.info(
+                        f"[Distill DEBUG E{epoch} step {_step_idx}] "
+                        f"dft={opt_metrics['_dbg_t_teacher_ms']:.0f}ms "
+                        f"rattle={opt_metrics['_dbg_t_rattle_ms']:.0f}ms "
+                        f"ema_fwd={opt_metrics['_dbg_t_ema_fwd_ms']:.0f}ms "
+                        f"s_fwd={opt_metrics['_dbg_t_s_fwd_ms']:.0f}ms "
+                        f"s_bwd+step={opt_metrics['_dbg_t_s_bwd_ms']:.0f}ms "
+                        f"| E_loss={opt_metrics.get('distill_energy', 0):.5f} "
+                        f"F_loss={opt_metrics.get('distill_forces', 0):.5f} "
+                        f"| step_total={opt_metrics['time']*1000:.0f}ms"
+                    )
+                    # Snapshot before keys are stripped below
+                    _dbg_step_data.append(dict(opt_metrics))
+                elif "_dbg_t_teacher_ms" in opt_metrics:
+                    # Warmup: only teacher is running
+                    logging.info(
+                        f"[Distill DEBUG E{epoch} step {_step_idx} WARMUP] "
+                        f"teacher_dft={opt_metrics['_dbg_t_teacher_ms']:.0f}ms "
+                        f"| step_total={opt_metrics['time']*1000:.0f}ms"
+                    )
+
+            # Strip debug keys before writing to JSON log (keeps log file clean)
+            if distill_debug:
+                for k in [k for k in opt_metrics if k.startswith("_dbg_")]:
+                    del opt_metrics[k]
+
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
             if rank == 0:
                 logger.log(opt_metrics)
+
+        # --- Epoch-level summary ---
+        if distill_debug and rank == 0 and distill_enabled and _dbg_step_data:
+            n = len(_dbg_step_data)
+            def _avg(key):
+                vals = [m[key] for m in _dbg_step_data if key in m]
+                return sum(vals) / len(vals) if vals else 0.0
+            epoch_wall = time.time() - _dbg_epoch_start
+            logging.info(
+                f"[Distill DEBUG E{epoch} SUMMARY] {n} steps in {epoch_wall:.1f}s | "
+                f"avg: dft={_avg('_dbg_t_teacher_ms'):.0f}ms "
+                f"rattle={_avg('_dbg_t_rattle_ms'):.0f}ms "
+                f"ema_fwd={_avg('_dbg_t_ema_fwd_ms'):.0f}ms "
+                f"s_fwd={_avg('_dbg_t_s_fwd_ms'):.0f}ms "
+                f"s_bwd+step={_avg('_dbg_t_s_bwd_ms'):.0f}ms "
+                f"step_total={_avg('time')*1000:.0f}ms | "
+                f"avg E_loss={_avg('distill_energy'):.5f} "
+                f"F_loss={_avg('distill_forces'):.5f}"
+            )
 
 
 def take_step(
@@ -549,6 +655,7 @@ def take_step(
     rattle_fn=None,
     augment_ratio: int = 1,
     dump_augmented_fn=None,
+    distill_debug: bool = False,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -581,16 +688,28 @@ def take_step(
         "time": time.time() - start_time,
     }
 
+    # Record teacher-DFT time before distillation block (debug only)
+    if distill_debug:
+        loss_dict["_dbg_t_teacher_ms"] = (time.time() - start_time) * 1000
+
     # --- Student distillation block (passenger: never touches the teacher graph) ---
     if distill_enabled and student is not None:
-        # Generate augmented configurations labelled cheaply by the EMA teacher
+        # --- Phase 1: Rattle / augment ---
+        if distill_debug:
+            _t1 = time.time()
         aug_batch = rattle_fn(batch)
+        if distill_debug:
+            loss_dict["_dbg_t_rattle_ms"] = (time.time() - _t1) * 1000
+            loss_dict["_dbg_n_aug_graphs"] = aug_batch.num_graphs
+            loss_dict["_dbg_n_aug_atoms"] = aug_batch.num_nodes
 
-        # Run EMA teacher on augmented batch.
+        # --- Phase 2: EMA teacher forward on augmented batch ---
         # Forces are computed via autograd.grad(energy, positions), so we cannot
-        # use torch.no_grad() here (it prevents graph construction for positions).
-        # Instead we detach all outputs immediately after, which breaks the graph
-        # before the student loss and ensures no gradient flows to teacher params.
+        # use torch.no_grad() here.  Detach all outputs immediately after to break
+        # the graph before the student loss.
+        if distill_debug:
+            _t2 = time.time()
+        _compute_stress = student_loss_fn.stress_weight.item() > 0
         if ema is not None:
             with ema.average_parameters():
                 teacher_out = model(
@@ -598,7 +717,7 @@ def take_step(
                     training=False,
                     compute_force=True,
                     compute_virials=False,
-                    compute_stress=(student_loss_fn.stress_weight.item() > 0),
+                    compute_stress=_compute_stress,
                 )
         else:
             teacher_out = model(
@@ -606,8 +725,10 @@ def take_step(
                 training=False,
                 compute_force=True,
                 compute_virials=False,
-                compute_stress=(student_loss_fn.stress_weight.item() > 0),
+                compute_stress=_compute_stress,
             )
+        if distill_debug:
+            loss_dict["_dbg_t_ema_fwd_ms"] = (time.time() - _t2) * 1000
 
         # Detach all teacher outputs — breaks the graph so student.backward() cannot
         # reach teacher parameters.
@@ -616,20 +737,36 @@ def take_step(
             for k, v in teacher_out.items()
         }
 
+        if distill_debug:
+            if "energy" in teacher_out and teacher_out["energy"] is not None:
+                loss_dict["_dbg_teacher_e_min"] = teacher_out["energy"].min().item()
+                loss_dict["_dbg_teacher_e_max"] = teacher_out["energy"].max().item()
+            if "forces" in teacher_out and teacher_out["forces"] is not None:
+                loss_dict["_dbg_teacher_f_rms"] = (
+                    teacher_out["forces"].pow(2).mean().sqrt().item()
+                )
+
         # Optional: save augmented batch + teacher labels to extxyz for debugging
         if dump_augmented_fn is not None:
             dump_augmented_fn(aug_batch, teacher_out)
 
-        # Student forward
+        # --- Phase 3: Student forward ---
+        if distill_debug:
+            _t3 = time.time()
         student_optimizer.zero_grad()
         student_out = student(
             aug_batch.to(device).to_dict(),
             training=True,
             compute_force=True,
             compute_virials=False,
-            compute_stress=(student_loss_fn.stress_weight.item() > 0),
+            compute_stress=_compute_stress,
         )
+        if distill_debug:
+            loss_dict["_dbg_t_s_fwd_ms"] = (time.time() - _t3) * 1000
 
+        # --- Phase 4: Distillation loss + backward + student step ---
+        if distill_debug:
+            _t4 = time.time()
         s_loss, s_loss_dict = student_loss_fn(student_out, teacher_out, aug_batch.to(device))
         s_loss.backward()
         if max_grad_norm:
@@ -637,6 +774,8 @@ def take_step(
         student_optimizer.step()
         if student_ema is not None:
             student_ema.update()
+        if distill_debug:
+            loss_dict["_dbg_t_s_bwd_ms"] = (time.time() - _t4) * 1000
 
         # Merge student loss dict (keys: distill_energy, distill_forces, distill_stress)
         for k, v in s_loss_dict.items():
