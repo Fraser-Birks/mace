@@ -922,8 +922,37 @@ def run(args) -> None:
             directory=args.checkpoints_dir,
             tag=tag + "_student",
             keep=args.keep_checkpoints,
-            swa_start=None,
+            swa_start=swa.start if swa else None,
         )
+        # Stage Two for the student: same schedule as teacher SWA
+        student_swa = None
+        if swa is not None:
+            from mace.tools.train import SWAContainer as _SWAContainer
+            from torch.optim.swa_utils import SWALR as _SWALR
+            from torch.optim.swa_utils import AveragedModel as _AveragedModel
+
+            student_swa_loss_fn = DistillationLoss(
+                energy_weight=args.swa_energy_weight,
+                forces_weight=args.swa_forces_weight,
+                stress_weight=args.distill_stress_weight,
+            )
+            student_swa = _SWAContainer(
+                model=_AveragedModel(student),
+                scheduler=_SWALR(
+                    optimizer=student_optimizer,
+                    swa_lr=args.swa_lr,
+                    anneal_epochs=1,
+                    anneal_strategy="linear",
+                ),
+                start=swa.start,
+                loss_fn=student_swa_loss_fn,
+            )
+            logging.info(
+                f"[Distillation] Stage Two enabled: distillation loss switches at "
+                f"epoch {swa.start} "
+                f"(energy_weight={args.swa_energy_weight}, "
+                f"forces_weight={args.swa_forces_weight})"
+            )
         rattle_fn = partial(
             rattle_batch,
             rattle_std=args.distill_rattle_std,
@@ -957,6 +986,7 @@ def run(args) -> None:
         )
     else:
         dump_augmented_fn = None
+        student_swa = None
     # --------------------------------------------------------------------------
 
     if args.lbfgs:
@@ -1055,6 +1085,7 @@ def run(args) -> None:
         student_ema=student_ema,
         student_lr_scheduler=student_lr_scheduler,
         student_checkpoint_handler=student_checkpoint_handler,
+        student_swa=student_swa,
         distill_warmup_epochs=getattr(args, "distill_warmup_epochs", 5),
         rattle_fn=rattle_fn,
         augment_ratio=getattr(args, "distill_augment_ratio", 1),
@@ -1226,6 +1257,32 @@ def run(args) -> None:
                 student_to_save = student_to_save.to("cpu")
             torch.save(student_to_save, student_path)
             logging.info(f"Student model saved to {student_path}")
+        elif student is not None and student_swa is not None and rank == 0 and swa_eval:
+            # Load the best Stage Two student checkpoint then export
+            try:
+                s_epoch = student_checkpoint_handler.load_latest(
+                    state=tools.CheckpointState(
+                        student, student_optimizer, student_lr_scheduler
+                    ),
+                    swa=True,
+                    device=device,
+                )
+            except Exception:  # pylint: disable=W0703
+                s_epoch = None
+            if s_epoch is not None:
+                logging.info(
+                    f"Loaded Stage Two student model from epoch {s_epoch} for export"
+                )
+                student_path = Path(args.model_dir) / (
+                    args.name + "_student_stagetwo.model"
+                )
+                logging.info(f"Saving Stage Two student model to {student_path}")
+                with student_ema.average_parameters():
+                    student_to_save = deepcopy(student)
+                if args.save_cpu:
+                    student_to_save = student_to_save.to("cpu")
+                torch.save(student_to_save, student_path)
+                logging.info(f"Stage Two student model saved to {student_path}")
 
         logging.info("Computing metrics for training, validation, and test sets")
         for param in model.parameters():
@@ -1260,6 +1317,48 @@ def run(args) -> None:
             logging.info("Error-table on TEST:\n" + str(table_test))
 
         # Student end-of-training evaluation (EMA weights, same loss as teacher)
+        if student is not None and student_swa is not None and swa_eval:
+            logging.info("Computing metrics for Stage Two student model")
+            for param in student.parameters():
+                param.requires_grad = False
+            student_param_ctx = (
+                student_ema.average_parameters()
+                if student_ema is not None
+                else nullcontext()
+            )
+            with student_param_ctx:
+                table_student_s2_tv = create_error_table(
+                    table_type=args.error_table,
+                    all_data_loaders=train_valid_data_loader,
+                    model=student,
+                    loss_fn=loss_fn,
+                    output_args=output_args,
+                    log_wandb=False,
+                    device=device,
+                    distributed=args.distributed,
+                    skip_heads=skip_heads,
+                )
+                logging.info(
+                    "Stage Two student error-table on TRAIN and VALID:\n"
+                    + str(table_student_s2_tv)
+                )
+                if test_data_loader:
+                    table_student_s2_test = create_error_table(
+                        table_type=args.error_table,
+                        all_data_loaders=test_data_loader,
+                        model=student,
+                        loss_fn=loss_fn,
+                        output_args=output_args,
+                        log_wandb=False,
+                        device=device,
+                        distributed=args.distributed,
+                    )
+                    logging.info(
+                        "Stage Two student error-table on TEST:\n"
+                        + str(table_student_s2_test)
+                    )
+            for param in student.parameters():
+                param.requires_grad = True
         if student is not None and not swa_eval:
             logging.info("Computing metrics for student model")
             for param in student.parameters():

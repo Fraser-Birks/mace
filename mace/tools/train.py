@@ -179,6 +179,7 @@ def train(
     student_ema: Optional[ExponentialMovingAverage] = None,
     student_lr_scheduler: Optional[torch.optim.lr_scheduler.ExponentialLR] = None,
     student_checkpoint_handler: Optional[CheckpointHandler] = None,
+    student_swa: Optional[SWAContainer] = None,
     distill_warmup_epochs: int = 5,
     rattle_fn=None,
     augment_ratio: int = 1,
@@ -253,10 +254,19 @@ def train(
                 lowest_loss = np.inf
                 swa_start = False
                 keep_last = True
+                if student_swa is not None:
+                    logging.info(
+                        "[Distillation] Switching to Stage Two distillation loss"
+                    )
             loss_fn = swa.loss_fn
             swa.model.update_parameters(model)
             if epoch > start_epoch:
                 swa.scheduler.step()
+            if student_swa is not None and distill_enabled:
+                student_loss_fn = student_swa.loss_fn
+                student_swa.model.update_parameters(student)
+                if epoch > start_epoch:
+                    student_swa.scheduler.step()
 
         # Train
         if distributed:
