@@ -9,6 +9,7 @@ import glob
 import json
 import logging
 import os
+from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
 from typing import List, Optional
@@ -1257,6 +1258,49 @@ def run(args) -> None:
                 distributed=args.distributed,
             )
             logging.info("Error-table on TEST:\n" + str(table_test))
+
+        # Student end-of-training evaluation (EMA weights, same loss as teacher)
+        if student is not None and not swa_eval:
+            logging.info("Computing metrics for student model")
+            for param in student.parameters():
+                param.requires_grad = False
+            student_param_ctx = (
+                student_ema.average_parameters()
+                if student_ema is not None
+                else nullcontext()
+            )
+            with student_param_ctx:
+                table_student_train_valid = create_error_table(
+                    table_type=args.error_table,
+                    all_data_loaders=train_valid_data_loader,
+                    model=student,
+                    loss_fn=loss_fn,
+                    output_args=output_args,
+                    log_wandb=False,
+                    device=device,
+                    distributed=args.distributed,
+                    skip_heads=skip_heads,
+                )
+                logging.info(
+                    "Student error-table on TRAIN and VALID:\n"
+                    + str(table_student_train_valid)
+                )
+                if test_data_loader:
+                    table_student_test = create_error_table(
+                        table_type=args.error_table,
+                        all_data_loaders=test_data_loader,
+                        model=student,
+                        loss_fn=loss_fn,
+                        output_args=output_args,
+                        log_wandb=False,
+                        device=device,
+                        distributed=args.distributed,
+                    )
+                    logging.info(
+                        "Student error-table on TEST:\n" + str(table_student_test)
+                    )
+            for param in student.parameters():
+                param.requires_grad = True
         if args.plot:
             try:
                 plotter = TrainingPlotter(
