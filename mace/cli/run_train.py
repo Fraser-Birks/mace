@@ -884,6 +884,8 @@ def run(args) -> None:
     student_checkpoint_handler = None
     distill_loss_fn = None
     rattle_fn = None
+    _target_head_name = heads[-1] if heads else "Default"
+    _target_head_teacher_idx = len(heads) - 1 if heads else 0
     if getattr(args, "distill", False):
         from functools import partial
 
@@ -896,7 +898,25 @@ def run(args) -> None:
             "atomic_inter_scale": teacher_config["atomic_inter_scale"],
             "atomic_inter_shift": teacher_config["atomic_inter_shift"],
         }
-        student_config = resolve_student_config(args, teacher_config, teacher_scale_shift)
+
+        # Identify the user's target head (last non-pt_head, or the only head).
+        # The student is always single-head, using only this head's E0s.
+        _target_head_name = next(
+            (h for h in reversed(heads) if h != "pt_head"), heads[-1]
+        )
+        _target_head_teacher_idx = heads.index(_target_head_name)
+        logging.info(
+            f"[Distillation] Student target head: '{_target_head_name}' "
+            f"(teacher head index {_target_head_teacher_idx})"
+        )
+
+        student_config = resolve_student_config(
+            args,
+            teacher_config,
+            teacher_scale_shift,
+            target_head_name=_target_head_name,
+            target_head_teacher_idx=_target_head_teacher_idx,
+        )
         student = _ScaleShiftMACE(**student_config).to(device)
         logging.info(
             f"Student model: {student_config.get('hidden_irreps')}, "
@@ -1107,6 +1127,8 @@ def run(args) -> None:
         distill_warmup_epochs=getattr(args, "distill_warmup_epochs", 5),
         distill_debug=getattr(args, "distill_debug", False),
         distill_num_heads=len(heads) if getattr(args, "distill", False) else 1,
+        distill_target_head_teacher_idx=_target_head_teacher_idx,
+        distill_target_head_name=_target_head_name,
         rattle_fn=rattle_fn,
         augment_ratio=getattr(args, "distill_augment_ratio", 1),
         dump_augmented_fn=dump_augmented_fn,
@@ -1297,8 +1319,10 @@ def run(args) -> None:
                     args.name + "_student_stagetwo.model"
                 )
                 logging.info(f"Saving Stage Two student model to {student_path}")
-                with student_ema.average_parameters():
-                    student_to_save = deepcopy(student)
+                # Save the SWA checkpoint weights directly — do NOT apply EMA here,
+                # since EMA accumulates across the full run and would give Stage One
+                # weights. Match the teacher export convention: deepcopy after load.
+                student_to_save = deepcopy(student)
                 if args.save_cpu:
                     student_to_save = student_to_save.to("cpu")
                 torch.save(student_to_save, student_path)

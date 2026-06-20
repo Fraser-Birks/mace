@@ -94,6 +94,8 @@ def resolve_student_config(
     args: Any,
     teacher_model_config: Dict[str, Any],
     teacher_scale_shift: Dict[str, Any],
+    target_head_name: str = "Default",
+    target_head_teacher_idx: int = 0,
 ) -> Dict[str, Any]:
     """Return a kwargs dict suitable for ``ScaleShiftMACE(**student_config)``.
 
@@ -133,6 +135,26 @@ def resolve_student_config(
     # which may already contain per-head lists or numpy arrays).
     student_config["atomic_inter_scale"] = teacher_scale_shift["atomic_inter_scale"]
     student_config["atomic_inter_shift"] = teacher_scale_shift["atomic_inter_shift"]
+
+    # --- Single-head student: always use the target head only ---------------
+    # The student is system-specific and should have exactly one head.
+    # If the teacher is multihead, atomic_energies is 2-D [n_elements, n_heads].
+    # Extract only the target head's column so the student uses the correct E0s
+    # regardless of what head index appears in any given batch.
+    student_config["heads"] = [target_head_name]
+    # atomic_energies from the teacher config has shape (n_heads, n_elements).
+    # For a single-head student we keep shape (1, n_elements) with only the
+    # target head's row — so the student uses the correct E0 reference.
+    ae = student_config.get("atomic_energies")
+    if ae is not None and hasattr(ae, "ndim") and ae.ndim == 2 and ae.shape[0] > 1:
+        student_config["atomic_energies"] = ae[[target_head_teacher_idx], :]
+        log.info(
+            "Multihead teacher detected: extracting E0s for head '%s' (idx=%d) "
+            "for single-head student",
+            target_head_name,
+            target_head_teacher_idx,
+        )
+    log.info("Student will have a single head: '%s'", target_head_name)
 
     # --- Step 2: apply named size preset ------------------------------------
     distill_size = getattr(args, "distill_size", None)

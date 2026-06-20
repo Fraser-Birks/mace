@@ -186,6 +186,8 @@ def train(
     dump_augmented_fn=None,
     distill_debug: bool = False,
     distill_num_heads: int = 1,
+    distill_target_head_teacher_idx: int = 0,
+    distill_target_head_name: str = "Default",
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -214,10 +216,10 @@ def train(
             logging.info("  Student training active from epoch 0 (no warmup)")
         if distill_num_heads > 1:
             logging.info(
-                f"  Multihead mode: student has {distill_num_heads} heads. "
-                "Student trains via EMA teacher pseudo-labels on ALL heads. "
-                "Validation RMSE for non-new heads compares against DFT labels "
-                "that the student was NOT directly trained on — high values are expected."
+                f"  Multihead teacher ({distill_num_heads} heads): student is "
+                f"single-head ('{distill_target_head_name}'). "
+                "Only batches from the target head are used for distillation; "
+                "pt_head / replay batches are skipped for the student."
             )
         if distill_debug:
             logging.info(
@@ -309,6 +311,7 @@ def train(
             augment_ratio=augment_ratio,
             dump_augmented_fn=dump_augmented_fn,
             distill_debug=distill_debug,
+            distill_target_head_teacher_idx=distill_target_head_teacher_idx,
         )
         if distributed:
             torch.distributed.barrier()
@@ -362,13 +365,15 @@ def train(
             if log_wandb:
                 wandb.log(wandb_log_dict)
 
-            # Student validation against DFT labels (only when distillation is active)
+            # Student validation against DFT labels (only when distillation is active).
+            # The student is single-head; only evaluate on the target head's valid_loader.
+            # Batch head indices are remapped to 0 (student's only head).
             if student is not None and distill_enabled and rank == 0:
                 if distill_debug:
                     _t_sval = time.time()
                     logging.info(
                         f"[Distill DEBUG E{epoch}] Student validation start "
-                        f"({len(valid_loaders)} loader(s))"
+                        f"(target head: '{distill_target_head_name}')"
                     )
                 student_param_ctx = (
                     student_ema.average_parameters()
@@ -376,13 +381,20 @@ def train(
                     else nullcontext()
                 )
                 with student_param_ctx:
-                    for valid_loader_name, valid_loader in valid_loaders.items():
+                    # Only validate on the loader that matches the student's target head.
+                    _student_val_loaders = {
+                        name: loader
+                        for name, loader in valid_loaders.items()
+                        if name == distill_target_head_name
+                    } or valid_loaders  # fallback: use all if name not found
+                    for valid_loader_name, valid_loader in _student_val_loaders.items():
                         s_valid_loss, s_metrics = evaluate(
                             model=student,
                             loss_fn=loss_fn,
                             data_loader=valid_loader,
                             output_args=output_args,
                             device=device,
+                            head_remap=0,
                         )
                         rmse_e = s_metrics.get("rmse_e_per_atom")
                         rmse_f = s_metrics.get("rmse_f")
@@ -506,6 +518,7 @@ def train_one_epoch(
     augment_ratio: int = 1,
     dump_augmented_fn=None,
     distill_debug: bool = False,
+    distill_target_head_teacher_idx: int = 0,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -564,6 +577,7 @@ def train_one_epoch(
                 augment_ratio=augment_ratio,
                 dump_augmented_fn=dump_augmented_fn,
                 distill_debug=distill_debug,
+                distill_target_head_teacher_idx=distill_target_head_teacher_idx,
             )
 
             # --- Verbose debug logging ---
@@ -656,6 +670,7 @@ def take_step(
     augment_ratio: int = 1,
     dump_augmented_fn=None,
     distill_debug: bool = False,
+    distill_target_head_teacher_idx: int = 0,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -694,10 +709,30 @@ def take_step(
 
     # --- Student distillation block (passenger: never touches the teacher graph) ---
     if distill_enabled and student is not None:
-        # --- Phase 1: Rattle / augment ---
+        # --- Phase 1: Filter to target-head graphs, then rattle / augment ---
+        # The student is single-head; skip any graphs that belong to pt_head or
+        # other non-target heads so the student only ever sees target-head geometry.
         if distill_debug:
             _t1 = time.time()
-        aug_batch = rattle_fn(batch)
+        if hasattr(batch, "head") and batch.head is not None:
+            _target_mask = (batch.head == distill_target_head_teacher_idx)
+            if not _target_mask.all():
+                # Build a sub-batch containing only target-head graphs.
+                _keep_indices = _target_mask.nonzero(as_tuple=True)[0].tolist()
+                if len(_keep_indices) == 0:
+                    # Entire batch is non-target (all pt_head). Skip student this step.
+                    if distill_debug:
+                        loss_dict["_dbg_t_rattle_ms"] = 0.0
+                        loss_dict["_dbg_n_aug_graphs"] = 0
+                        loss_dict["_dbg_n_aug_atoms"] = 0
+                    return to_numpy(loss), loss_dict
+                _target_graphs = [batch.get_example(_i) for _i in _keep_indices]
+                _target_batch = torch_geometric.batch.Batch.from_data_list(_target_graphs)
+                aug_batch = rattle_fn(_target_batch)
+            else:
+                aug_batch = rattle_fn(batch)
+        else:
+            aug_batch = rattle_fn(batch)
         if distill_debug:
             loss_dict["_dbg_t_rattle_ms"] = (time.time() - _t1) * 1000
             loss_dict["_dbg_n_aug_graphs"] = aug_batch.num_graphs
@@ -707,13 +742,25 @@ def take_step(
         # Forces are computed via autograd.grad(energy, positions), so we cannot
         # use torch.no_grad() here.  Detach all outputs immediately after to break
         # the graph before the student loss.
+        # The aug_batch is already filtered to target-head graphs only, but we
+        # explicitly remap head indices to distill_target_head_teacher_idx so the
+        # teacher always uses the user's head E0s/readout (not pt_head).
         if distill_debug:
             _t2 = time.time()
         _compute_stress = student_loss_fn.stress_weight.item() > 0
+        _aug_batch_dev = aug_batch.to(device)
+        _aug_dict_teacher = _aug_batch_dev.to_dict()
+        # Remap to target head in teacher space
+        _aug_dict_teacher["head"] = torch.full(
+            (aug_batch.num_graphs,),
+            distill_target_head_teacher_idx,
+            dtype=torch.long,
+            device=device,
+        )
         if ema is not None:
             with ema.average_parameters():
                 teacher_out = model(
-                    aug_batch.to(device).to_dict(),
+                    _aug_dict_teacher,
                     training=False,
                     compute_force=True,
                     compute_virials=False,
@@ -721,7 +768,7 @@ def take_step(
                 )
         else:
             teacher_out = model(
-                aug_batch.to(device).to_dict(),
+                _aug_dict_teacher,
                 training=False,
                 compute_force=True,
                 compute_virials=False,
@@ -751,11 +798,16 @@ def take_step(
             dump_augmented_fn(aug_batch, teacher_out)
 
         # --- Phase 3: Student forward ---
+        # Student is single-head (head index 0), so remap the head field.
         if distill_debug:
             _t3 = time.time()
         student_optimizer.zero_grad()
+        _aug_dict_student = {**_aug_dict_teacher}  # shallow copy; shares tensors
+        _aug_dict_student["head"] = torch.zeros(
+            aug_batch.num_graphs, dtype=torch.long, device=device
+        )
         student_out = student(
-            aug_batch.to(device).to_dict(),
+            _aug_dict_student,
             training=True,
             compute_force=True,
             compute_virials=False,
@@ -767,7 +819,7 @@ def take_step(
         # --- Phase 4: Distillation loss + backward + student step ---
         if distill_debug:
             _t4 = time.time()
-        s_loss, s_loss_dict = student_loss_fn(student_out, teacher_out, aug_batch.to(device))
+        s_loss, s_loss_dict = student_loss_fn(student_out, teacher_out, _aug_batch_dev)
         s_loss.backward()
         if max_grad_norm:
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_grad_norm)
@@ -903,6 +955,7 @@ def evaluate(
     data_loader: DataLoader,
     output_args: Dict[str, bool],
     device: torch.device,
+    head_remap: Optional[int] = None,
 ) -> Tuple[float, Dict[str, Any]]:
 
     metrics = MACELoss(loss_fn=loss_fn).to(device)
@@ -913,6 +966,10 @@ def evaluate(
         for batch in data_loader:
             batch = batch.to(device)
             batch_dict = batch.to_dict()
+            if head_remap is not None:
+                batch_dict["head"] = torch.full(
+                    (batch.num_graphs,), head_remap, dtype=torch.long, device=device
+                )
             output = model(
                 batch_dict,
                 training=False,
