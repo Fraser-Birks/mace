@@ -38,6 +38,10 @@ from .utils import (
 )
 
 
+# Sentinel: printed once per process lifetime when --distill_debug is active
+_DISTILL_DEBUG_BANNER_PRINTED: bool = False
+
+
 @dataclasses.dataclass
 class SWAContainer:
     model: AveragedModel
@@ -546,9 +550,26 @@ def train_one_epoch(
             logger.log(opt_metrics)
     else:
         if distill_debug:
+            global _DISTILL_DEBUG_BANNER_PRINTED
             _dbg_epoch_start = time.time()
             _dbg_step_data: List[Dict[str, Any]] = []
             if distill_enabled:
+                if not _DISTILL_DEBUG_BANNER_PRINTED:
+                    _DISTILL_DEBUG_BANNER_PRINTED = True
+                    logging.info(
+                        "[Distill DEBUG] Pipeline phases logged per step:\n"
+                        "  dft        — teacher forward+backward on the labelled batch "
+                        "(DFT loss; teacher weights updated here)\n"
+                        "  rattle     — random displacements + strain applied to batch "
+                        "geometries to create augmented configs\n"
+                        "  ema_fwd    — EMA teacher labels the augmented batch "
+                        "(outputs detached: no gradient flows back to teacher)\n"
+                        "  s_fwd      — student forward pass on augmented batch\n"
+                        "  s_bwd+step — student distillation loss, backward, gradient "
+                        "clip, optimizer step, student EMA update\n"
+                        "  E_loss / F_loss — per-step distillation MSE (eV² and "
+                        "(eV/Å)²) before loss weighting"
+                    )
                 logging.info(
                     f"[Distill DEBUG E{epoch}] Epoch start — distillation ACTIVE"
                 )
