@@ -930,10 +930,32 @@ def run(args) -> None:
             n_augment=args.distill_augment_ratio,
             device=device,
         )
+
+        # Optional augmented-config dump for debugging
+        dump_augmented_fn = None
+        if getattr(args, "distill_dump_augmented_xyz", None):
+            from mace.tools.distill_utils import save_augmented_xyz as _save_aug_xyz
+
+            _dump_path = args.distill_dump_augmented_xyz
+            _z_list = list(z_table.zs)
+            _dump_total = [0]
+
+            def dump_augmented_fn(aug_batch, teacher_out):  # noqa: E306
+                n = _save_aug_xyz(aug_batch, teacher_out, _dump_path, _z_list)
+                _dump_total[0] += n
+                if _dump_total[0] % 100 == 0:
+                    logging.info(
+                        f"[Distillation] {_dump_total[0]} augmented structures written to {_dump_path}"
+                    )
+
+            logging.info(f"[Distillation] Augmented configs will be written to {_dump_path}")
+
         logging.info(
             f"Distillation enabled: warmup={args.distill_warmup_epochs} epochs, "
             f"augment_ratio={args.distill_augment_ratio}, sampler={args.distill_sampler}"
         )
+    else:
+        dump_augmented_fn = None
     # --------------------------------------------------------------------------
 
     if args.lbfgs:
@@ -1035,6 +1057,7 @@ def run(args) -> None:
         distill_warmup_epochs=getattr(args, "distill_warmup_epochs", 5),
         rattle_fn=rattle_fn,
         augment_ratio=getattr(args, "distill_augment_ratio", 1),
+        dump_augmented_fn=dump_augmented_fn,
     )
 
     logging.info("")

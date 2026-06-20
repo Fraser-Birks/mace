@@ -1051,6 +1051,15 @@ def build_default_arg_parser() -> argparse.ArgumentParser:
         choices=["rattle"],
         default="rattle",
     )
+    parser.add_argument(
+        "--distill_dump_augmented_xyz",
+        help=(
+            "path to an extxyz file where augmented structures and EMA-teacher labels "
+            "are written each training step (for debugging); omit to disable"
+        ),
+        type=str,
+        default=None,
+    )
 
     parser.add_argument(
         "--max_num_epochs", help="Maximum number of epochs", type=int, default=2048

@@ -182,6 +182,7 @@ def train(
     distill_warmup_epochs: int = 5,
     rattle_fn=None,
     augment_ratio: int = 1,
+    dump_augmented_fn=None,
 ):
     lowest_loss = np.inf
     valid_loss = np.inf
@@ -198,6 +199,18 @@ def train(
     logging.info("===========TRAINING===========")
     logging.info("Started training, reporting errors on validation set")
     logging.info("Loss metrics on validation set")
+    if student is not None:
+        logging.info("")
+        logging.info("=========== DISTILLATION MODE ===========")
+        if distill_warmup_epochs > 0:
+            logging.info(
+                f"  Student will begin training at epoch {distill_warmup_epochs} "
+                f"(warmup: {distill_warmup_epochs} epochs)"
+            )
+        else:
+            logging.info("  Student training active from epoch 0 (no warmup)")
+        logging.info("=========================================")
+        logging.info("")
     epoch = start_epoch
 
     # log validation loss before _any_ training
@@ -216,9 +229,15 @@ def train(
 
     # variable used for broadcast by rank == 0 if epoch loop is exited early, e.g. patience
     exit_now = torch.zeros(1, device=device) if distributed else None
+    _prev_distill_enabled = False
     while epoch < max_num_epochs:
         # Determine whether distillation is active this epoch (warmup gate)
         distill_enabled = (student is not None) and (epoch >= distill_warmup_epochs)
+        if distill_enabled and not _prev_distill_enabled:
+            logging.info(
+                f"[Distillation] Warmup complete — student training active from epoch {epoch}"
+            )
+        _prev_distill_enabled = distill_enabled
 
         # LR scheduler and SWA update
         if swa is None or epoch < swa.start:
@@ -265,6 +284,7 @@ def train(
             distill_enabled=distill_enabled,
             rattle_fn=rattle_fn,
             augment_ratio=augment_ratio,
+            dump_augmented_fn=dump_augmented_fn,
         )
         if distributed:
             torch.distributed.barrier()
@@ -317,6 +337,36 @@ def train(
                 )
             if log_wandb:
                 wandb.log(wandb_log_dict)
+
+            # Student validation against DFT labels (only when distillation is active)
+            if student is not None and distill_enabled and rank == 0:
+                student_param_ctx = (
+                    student_ema.average_parameters()
+                    if student_ema is not None
+                    else nullcontext()
+                )
+                with student_param_ctx:
+                    for valid_loader_name, valid_loader in valid_loaders.items():
+                        s_valid_loss, s_metrics = evaluate(
+                            model=student,
+                            loss_fn=loss_fn,
+                            data_loader=valid_loader,
+                            output_args=output_args,
+                            device=device,
+                        )
+                        rmse_e = s_metrics.get("rmse_e_per_atom")
+                        rmse_f = s_metrics.get("rmse_f")
+                        parts = [f"Student Epoch {epoch} [{valid_loader_name}]: loss={s_valid_loss:.6f}"]
+                        if rmse_e is not None:
+                            parts.append(f"RMSE_E_per_atom={rmse_e * 1e3:.2f} meV")
+                        if rmse_f is not None:
+                            parts.append(f"RMSE_F={rmse_f * 1e3:.2f} meV/A")
+                        logging.info(", ".join(parts))
+                        s_metrics["mode"] = "student_eval"
+                        s_metrics["epoch"] = epoch
+                        s_metrics["head"] = valid_loader_name
+                        logger.log(s_metrics)
+
             if rank == 0:
                 if valid_loss >= lowest_loss:
                     patience_counter += 1
@@ -419,6 +469,7 @@ def train_one_epoch(
     distill_enabled: bool = False,
     rattle_fn=None,
     augment_ratio: int = 1,
+    dump_augmented_fn=None,
 ) -> None:
     model_to_train = model if distributed_model is None else distributed_model
 
@@ -462,6 +513,7 @@ def train_one_epoch(
                 distill_enabled=distill_enabled,
                 rattle_fn=rattle_fn,
                 augment_ratio=augment_ratio,
+                dump_augmented_fn=dump_augmented_fn,
             )
             opt_metrics["mode"] = "opt"
             opt_metrics["epoch"] = epoch
@@ -486,6 +538,7 @@ def take_step(
     distill_enabled: bool = False,
     rattle_fn=None,
     augment_ratio: int = 1,
+    dump_augmented_fn=None,
 ) -> Tuple[float, Dict[str, Any]]:
     start_time = time.time()
     batch = batch.to(device)
@@ -552,6 +605,10 @@ def take_step(
             k: v.detach() if isinstance(v, torch.Tensor) else v
             for k, v in teacher_out.items()
         }
+
+        # Optional: save augmented batch + teacher labels to extxyz for debugging
+        if dump_augmented_fn is not None:
+            dump_augmented_fn(aug_batch, teacher_out)
 
         # Student forward
         student_optimizer.zero_grad()

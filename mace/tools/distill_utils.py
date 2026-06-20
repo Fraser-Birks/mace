@@ -21,6 +21,10 @@ resolve_student_config(args, teacher_model_config, teacher_scale_shift) -> dict
 rattle_batch(batch, rattle_std, strain_std, n_augment, device) -> Batch
     Generate perturbed copies of each structure in a ``torch_geometric.Batch``
     for on-the-fly augmentation.
+
+save_augmented_xyz(aug_batch, teacher_out, path, z_list) -> int
+    Append augmented structures with teacher-predicted labels to an extxyz file.
+    Returns the number of structures written.
 """
 
 import logging
@@ -287,3 +291,77 @@ def rattle_batch(
         result = aug
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Augmented config dump (debugging)
+# ---------------------------------------------------------------------------
+
+
+def save_augmented_xyz(
+    aug_batch: "torch_geometric.Batch",
+    teacher_out: dict,
+    path: str,
+    z_list: list,
+) -> int:
+    """Append augmented structures with EMA-teacher labels to an extxyz file.
+
+    Each structure in ``aug_batch`` is written as an extended-XYZ entry with
+    ``teacher_energy`` (eV) and ``teacher_forces`` (eV/Å) as properties so you
+    can inspect the augmented data in OVITO, ASE, or any XYZ viewer.
+
+    Parameters
+    ----------
+    aug_batch:
+        The rattled/strained batch returned by ``rattle_batch``.
+    teacher_out:
+        Detached EMA-teacher output dict (keys ``"energy"``, ``"forces"``).
+    path:
+        File path to write/append to.  Will be created on first call.
+    z_list:
+        Ordered list of atomic numbers corresponding to the one-hot element
+        axis in ``aug_batch.node_attrs``.  Pass ``list(z_table.zs)`` or
+        ``model.atomic_numbers.tolist()``.
+
+    Returns
+    -------
+    int
+        Number of structures written in this call.
+    """
+    import numpy as np
+
+    try:
+        import ase.io
+        from ase.atoms import Atoms
+    except ImportError as exc:
+        raise ImportError("ase is required for save_augmented_xyz") from exc
+
+    n_graphs = aug_batch.num_graphs
+    positions = aug_batch.positions.detach().cpu().numpy()   # [n_atoms, 3]
+    cell_flat = aug_batch.cell.detach().cpu().numpy()        # [n_graphs*3, 3]
+    cell_3d = cell_flat.reshape(n_graphs, 3, 3)
+    graph_idx = aug_batch.batch.cpu().numpy()                # [n_atoms]
+    # node_attrs is one-hot [n_atoms, n_elements]; argmax gives element table index
+    elem_indices = aug_batch.node_attrs.cpu().argmax(dim=-1).numpy()
+    atomic_nums = np.array([z_list[i] for i in elem_indices])
+
+    energies = teacher_out.get("energy")
+    forces = teacher_out.get("forces")
+
+    atoms_list = []
+    for g in range(n_graphs):
+        mask = graph_idx == g
+        at = Atoms(
+            numbers=atomic_nums[mask],
+            positions=positions[mask],
+            cell=cell_3d[g],
+            pbc=True,
+        )
+        if energies is not None:
+            at.info["teacher_energy"] = float(energies[g].cpu().item())
+        if forces is not None:
+            at.arrays["teacher_forces"] = forces[mask].detach().cpu().numpy()
+        atoms_list.append(at)
+
+    ase.io.write(path, atoms_list, format="extxyz", append=True)
+    return n_graphs
