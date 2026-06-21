@@ -82,6 +82,7 @@ class MACE(torch.nn.Module):
         keep_last_layer_irreps: bool = False,
     ):
         super().__init__()
+        self.channel_gates: Optional[torch.nn.ModuleList] = None
         self.register_buffer(
             "atomic_numbers", torch.tensor(atomic_numbers, dtype=torch.int64)
         )
@@ -379,6 +380,8 @@ class MACE(torch.nn.Module):
             )
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            if self.channel_gates is not None:
+                node_feats = self.channel_gates[i](node_feats)
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
@@ -559,6 +562,8 @@ class ScaleShiftMACE(MACE):
             )
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            if self.channel_gates is not None:
+                node_feats = self.channel_gates[i](node_feats)
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
