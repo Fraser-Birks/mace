@@ -42,6 +42,43 @@ from .utils import (
 )
 
 
+def _gate_flat(
+    sc: torch.Tensor, g: torch.Tensor, hidden_irreps
+) -> torch.Tensor:
+    """Apply a per-channel gate g (shape [num_features]) to a flat skip-connection sc.
+
+    Assumes uniform multiplicity across all irrep types in hidden_irreps (all muls == num_features).
+    For each irrep type, channel k occupies a contiguous block of ir.dim elements within
+    the type's segment, so the gate mask is constructed by tiling g across each segment.
+    """
+    hidden_irreps = o3.Irreps(hidden_irreps)  # ensure Irreps object (may be a str)
+    mask = torch.zeros(hidden_irreps.dim, dtype=sc.dtype, device=sc.device)
+    offset = 0
+    for mul, ir in hidden_irreps:
+        d = ir.dim
+        for m in range(mul):
+            mask[offset + m * d : offset + (m + 1) * d] = g[m]
+        offset += mul * d
+    return sc * mask.unsqueeze(0)
+
+
+def _make_linear_up_gate_hook(g: torch.Tensor, edge_irreps_str: str):
+    """Return a forward hook that gates the linear_up output.
+
+    Used in non-first interaction layers to prevent non-kept channels from
+    re-entering the computation after channel gating.  The hook zeroes the
+    linear_up output at non-kept channel positions before it reaches conv_tp.
+
+    Args:
+        g: Gate vector (shape [num_features]).
+        edge_irreps_str: String representation of the interaction's edge_irreps
+            (= linear_up output irreps). Used to build the flat gate mask.
+    """
+    def hook(module, input, output):
+        return _gate_flat(output, g, edge_irreps_str)
+    return hook
+
+
 @compile_mode("script")
 class MACE(torch.nn.Module):
     def __init__(
@@ -367,6 +404,17 @@ class MACE(torch.nn.Module):
             node_attrs_slice = data["node_attrs"]
             if is_lammps and i > 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            # For non-first interaction layers, gate the linear_up output to prevent
+            # non-kept channels from re-entering the computation via channel mixing.
+            # linear_up has a full weight matrix: even with zeroed non-kept input,
+            # its output at non-kept positions is non-zero and pollutes conv_tp.
+            _linear_up_hook_handle = None
+            if self.channel_gates is not None and i > 0:
+                prev_inter = self.interactions[i - 1]
+                prev_gate = self.channel_gates[i - 1]
+                _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
+                    _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
+                )
             node_feats, sc = interaction(
                 node_attrs=node_attrs_slice,
                 node_feats=node_feats,
@@ -378,13 +426,25 @@ class MACE(torch.nn.Module):
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,
             )
+            if _linear_up_hook_handle is not None:
+                _linear_up_hook_handle.remove()
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
             if self.channel_gates is not None:
                 node_feats = self.channel_gates[i](node_feats)
+                if sc is not None:
+                    sc = _gate_flat(sc, self.channel_gates[i].g, interaction.hidden_irreps)
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
+            if self.channel_gates is not None:
+                # Gate the flat product output to zero out pruned channels.
+                # The product linear mixes channels, so pruned channels in the
+                # product output are non-zero even though their inputs were zero.
+                # We must zero them again before they're used in the next layer.
+                node_feats = _gate_flat(
+                    node_feats, self.channel_gates[i].g, interaction.hidden_irreps
+                )
             node_feats_concat.append(node_feats)
 
         for i, readout in enumerate(self.readouts):
@@ -549,6 +609,15 @@ class ScaleShiftMACE(MACE):
             node_attrs_slice = data["node_attrs"]
             if is_lammps and i > 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
+            # For non-first interaction layers, gate the linear_up output to prevent
+            # non-kept channels from re-entering the computation via channel mixing.
+            _linear_up_hook_handle = None
+            if self.channel_gates is not None and i > 0:
+                prev_inter = self.interactions[i - 1]
+                prev_gate = self.channel_gates[i - 1]
+                _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
+                    _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
+                )
             node_feats, sc = interaction(
                 node_attrs=node_attrs_slice,
                 node_feats=node_feats,
@@ -560,13 +629,25 @@ class ScaleShiftMACE(MACE):
                 lammps_class=lammps_class,
                 lammps_natoms=lammps_natoms,
             )
+            if _linear_up_hook_handle is not None:
+                _linear_up_hook_handle.remove()
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
             if self.channel_gates is not None:
                 node_feats = self.channel_gates[i](node_feats)
+                if sc is not None:
+                    sc = _gate_flat(sc, self.channel_gates[i].g, interaction.hidden_irreps)
             node_feats = product(
                 node_feats=node_feats, sc=sc, node_attrs=node_attrs_slice
             )
+            if self.channel_gates is not None:
+                # Gate the flat product output to zero out pruned channels.
+                # The product linear mixes channels, so pruned channels in the
+                # product output are non-zero even though their inputs were zero.
+                # We must zero them again before they're used in the next layer.
+                node_feats = _gate_flat(
+                    node_feats, self.channel_gates[i].g, interaction.hidden_irreps
+                )
             node_feats_list.append(node_feats)
 
         for i, readout in enumerate(self.readouts):

@@ -46,7 +46,17 @@ from .models import (
     ScaleShiftMACE,
 )
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
-from .prune import ChannelGate, CubicPruningSchedule, DistillationLoss, TaylorImportance, TeacherWrapper, _infer_num_features, make_gated
+from .prune import (
+    ChannelGate,
+    CubicPruningSchedule,
+    DistillationLoss,
+    TaylorImportance,
+    TeacherWrapper,
+    _infer_num_features,
+    _prune_irreps,
+    make_gated,
+    rebuild,
+)
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
     compute_avg_num_neighbors,
@@ -132,7 +142,9 @@ __all__ = [
     "compute_dielectric_gradients",
     "ChannelGate",
     "_infer_num_features",
+    "_prune_irreps",
     "make_gated",
+    "rebuild",
     "TeacherWrapper",
     "DistillationLoss",
     "TaylorImportance",
