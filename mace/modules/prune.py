@@ -4,6 +4,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from e3nn import o3
 
 
@@ -46,3 +47,51 @@ def make_gated(model: nn.Module) -> nn.Module:
         [ChannelGate(num_features) for _ in student.interactions]
     )
     return student
+
+
+class TeacherWrapper:
+    """Wraps a frozen teacher model for label generation."""
+
+    def __init__(self, model: nn.Module) -> None:
+        self.model = copy.deepcopy(model)
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+    def get_labels(
+        self, batch: dict
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Return (E_teacher, F_teacher) with no gradient.
+
+        Note: torch.no_grad() cannot be used here because MACE computes forces
+        via torch.autograd.grad, which requires a live computation graph.
+        Instead, model parameters are already frozen via requires_grad_(False),
+        so no parameter gradients accumulate. Outputs are detached before return.
+        """
+        out = self.model(batch, compute_force=True)
+        energy = out["energy"].detach()
+        forces = out.get("forces")
+        if forces is not None:
+            forces = forces.detach()
+        return energy, forces
+
+
+class DistillationLoss(nn.Module):
+    """Weighted MSE on energies (and optionally forces) between student and teacher."""
+
+    def __init__(self, w_energy: float = 1.0, w_forces: float = 100.0) -> None:
+        super().__init__()
+        self.w_energy = w_energy
+        self.w_forces = w_forces
+
+    def forward(
+        self,
+        student_out: dict,
+        E_teacher: torch.Tensor,
+        F_teacher: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        loss = self.w_energy * F.mse_loss(student_out["energy"], E_teacher)
+        if self.w_forces > 0 and F_teacher is not None:
+            F_student = student_out.get("forces")
+            if F_student is not None:
+                loss = loss + self.w_forces * F.mse_loss(F_student, F_teacher)
+        return loss
