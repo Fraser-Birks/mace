@@ -17,6 +17,7 @@ from .torch_tools import (
     to_one_hot,
     voigt_to_matrix,
 )
+from .prune_utils import ChannelPruner, PruneConfig
 from .train import SWAContainer, evaluate, train
 from .utils import (
     AtomicNumberTable,
@@ -34,6 +35,8 @@ from .utils import (
 )
 
 __all__ = [
+    "ChannelPruner",
+    "PruneConfig",
     "TensorDict",
     "AtomicNumberTable",
     "atomic_numbers_to_indices",
