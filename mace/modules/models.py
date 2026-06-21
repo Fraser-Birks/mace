@@ -415,19 +415,21 @@ class MACE(torch.nn.Module):
                 _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
                     _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
                 )
-            node_feats, sc = interaction(
-                node_attrs=node_attrs_slice,
-                node_feats=node_feats,
-                edge_attrs=edge_attrs,
-                edge_feats=edge_feats,
-                edge_index=data["edge_index"],
-                cutoff=cutoff,
-                first_layer=(i == 0),
-                lammps_class=lammps_class,
-                lammps_natoms=lammps_natoms,
-            )
-            if _linear_up_hook_handle is not None:
-                _linear_up_hook_handle.remove()
+            try:
+                node_feats, sc = interaction(
+                    node_attrs=node_attrs_slice,
+                    node_feats=node_feats,
+                    edge_attrs=edge_attrs,
+                    edge_feats=edge_feats,
+                    edge_index=data["edge_index"],
+                    cutoff=cutoff,
+                    first_layer=(i == 0),
+                    lammps_class=lammps_class,
+                    lammps_natoms=lammps_natoms,
+                )
+            finally:
+                if _linear_up_hook_handle is not None:
+                    _linear_up_hook_handle.remove()
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
             if self.channel_gates is not None:
@@ -618,19 +620,21 @@ class ScaleShiftMACE(MACE):
                 _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
                     _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
                 )
-            node_feats, sc = interaction(
-                node_attrs=node_attrs_slice,
-                node_feats=node_feats,
-                edge_attrs=edge_attrs,
-                edge_feats=edge_feats,
-                edge_index=data["edge_index"],
-                cutoff=cutoff,
-                first_layer=(i == 0),
-                lammps_class=lammps_class,
-                lammps_natoms=lammps_natoms,
-            )
-            if _linear_up_hook_handle is not None:
-                _linear_up_hook_handle.remove()
+            try:
+                node_feats, sc = interaction(
+                    node_attrs=node_attrs_slice,
+                    node_feats=node_feats,
+                    edge_attrs=edge_attrs,
+                    edge_feats=edge_feats,
+                    edge_index=data["edge_index"],
+                    cutoff=cutoff,
+                    first_layer=(i == 0),
+                    lammps_class=lammps_class,
+                    lammps_natoms=lammps_natoms,
+                )
+            finally:
+                if _linear_up_hook_handle is not None:
+                    _linear_up_hook_handle.remove()
             if is_lammps and i == 0:
                 node_attrs_slice = node_attrs_slice[: lammps_natoms[0]]
             if self.channel_gates is not None:
