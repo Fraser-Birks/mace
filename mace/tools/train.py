@@ -26,6 +26,7 @@ from mace.cli.visualise_train import TrainingPlotter
 
 from . import torch_geometric
 from .checkpoint import CheckpointHandler, CheckpointState
+from .distill_utils import filter_batch_by_head
 from .torch_tools import to_numpy
 from .utils import (
     MetricsLogger,
@@ -735,25 +736,15 @@ def take_step(
         # other non-target heads so the student only ever sees target-head geometry.
         if distill_debug:
             _t1 = time.time()
-        if hasattr(batch, "head") and batch.head is not None:
-            _target_mask = (batch.head == distill_target_head_teacher_idx)
-            if not _target_mask.all():
-                # Build a sub-batch containing only target-head graphs.
-                _keep_indices = _target_mask.nonzero(as_tuple=True)[0].tolist()
-                if len(_keep_indices) == 0:
-                    # Entire batch is non-target (all pt_head). Skip student this step.
-                    if distill_debug:
-                        loss_dict["_dbg_t_rattle_ms"] = 0.0
-                        loss_dict["_dbg_n_aug_graphs"] = 0
-                        loss_dict["_dbg_n_aug_atoms"] = 0
-                    return to_numpy(loss), loss_dict
-                _target_graphs = [batch.get_example(_i) for _i in _keep_indices]
-                _target_batch = torch_geometric.batch.Batch.from_data_list(_target_graphs)
-                aug_batch = rattle_fn(_target_batch)
-            else:
-                aug_batch = rattle_fn(batch)
-        else:
-            aug_batch = rattle_fn(batch)
+        _target_batch = filter_batch_by_head(batch, distill_target_head_teacher_idx)
+        if _target_batch is None:
+            # Entire batch is non-target (e.g. all pt_head). Skip student this step.
+            if distill_debug:
+                loss_dict["_dbg_t_rattle_ms"] = 0.0
+                loss_dict["_dbg_n_aug_graphs"] = 0
+                loss_dict["_dbg_n_aug_atoms"] = 0
+            return to_numpy(loss), loss_dict
+        aug_batch = rattle_fn(_target_batch)
         if distill_debug:
             loss_dict["_dbg_t_rattle_ms"] = (time.time() - _t1) * 1000
             loss_dict["_dbg_n_aug_graphs"] = aug_batch.num_graphs

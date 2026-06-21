@@ -1381,6 +1381,7 @@ def run(args) -> None:
                     device=device,
                     distributed=args.distributed,
                     skip_heads=skip_heads,
+                    head_remap=0,
                 )
                 logging.info(
                     "Stage Two student error-table on TRAIN and VALID:\n"
@@ -1396,6 +1397,7 @@ def run(args) -> None:
                         log_wandb=False,
                         device=device,
                         distributed=args.distributed,
+                        head_remap=0,
                     )
                     logging.info(
                         "Stage Two student error-table on TEST:\n"
@@ -1423,6 +1425,7 @@ def run(args) -> None:
                     device=device,
                     distributed=args.distributed,
                     skip_heads=skip_heads,
+                    head_remap=0,
                 )
                 logging.info(
                     "Student error-table on TRAIN and VALID:\n"
@@ -1438,6 +1441,7 @@ def run(args) -> None:
                         log_wandb=False,
                         device=device,
                         distributed=args.distributed,
+                        head_remap=0,
                     )
                     logging.info(
                         "Student error-table on TEST:\n" + str(table_student_test)

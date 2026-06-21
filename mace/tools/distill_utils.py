@@ -18,6 +18,11 @@ resolve_student_config(args, teacher_model_config, teacher_scale_shift) -> dict
     Merge size preset + explicit CLI overrides into a kwargs dict ready
     to be passed as ``ScaleShiftMACE(**student_config)``.
 
+filter_batch_by_head(batch, target_head_idx) -> Batch | None
+    Return a sub-batch containing only graphs whose head == target_head_idx.
+    Works at the tensor level (no AtomicData constructor calls).
+    Returns None when no graphs match.
+
 rattle_batch(batch, rattle_std, strain_std, n_augment, device) -> Batch
     Generate perturbed copies of each structure in a ``torch_geometric.Batch``
     for on-the-fly augmentation.
@@ -28,7 +33,7 @@ save_augmented_xyz(aug_batch, teacher_out, path, z_list) -> int
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import torch
 from e3nn import o3
@@ -207,6 +212,132 @@ def resolve_student_config(
     )
 
     return student_config
+
+
+# ---------------------------------------------------------------------------
+# filter_batch_by_head
+# ---------------------------------------------------------------------------
+
+
+def filter_batch_by_head(
+    batch: "torch_geometric.Batch",
+    target_head_idx: int,
+) -> "Optional[torch_geometric.Batch]":
+    """Return a sub-batch containing only graphs where head == *target_head_idx*.
+
+    Works entirely at the tensor level, avoiding ``batch.get_example()`` /
+    ``Batch.from_data_list()`` which both call ``AtomicData()`` with no
+    arguments and crash because ``AtomicData.__init__`` requires positional args.
+
+    Parameters
+    ----------
+    batch:
+        A ``torch_geometric.Batch`` (or similar) produced by the training
+        dataloader.  Must have a ``head`` attribute of shape ``[n_graphs]``.
+    target_head_idx:
+        Integer head index to keep.
+
+    Returns
+    -------
+    torch_geometric.Batch | None
+        Filtered batch, or ``None`` if no graphs in *batch* match
+        *target_head_idx*.  Returns *batch* unchanged if all graphs match.
+    """
+    if not (hasattr(batch, "head") and batch.head is not None):
+        return batch
+
+    graph_mask = batch.head == target_head_idx  # [n_graphs] bool
+    if graph_mask.all():
+        return batch
+    if not graph_mask.any():
+        return None
+
+    keep = graph_mask.nonzero(as_tuple=True)[0]  # LongTensor [n_keep]
+    n_keep = int(keep.numel())
+    n_graphs_orig = int(batch.num_graphs)
+    dev = keep.device
+
+    # ── Atom-level bookkeeping ──────────────────────────────────────────────
+    graph_per_atom = batch.batch  # [n_atoms] atom→graph index
+    atom_mask = graph_mask[graph_per_atom]  # [n_atoms] bool
+
+    # Remap: old graph index → new graph index in [0, n_keep)
+    remap = torch.full((n_graphs_orig,), -1, dtype=torch.long, device=dev)
+    remap[keep] = torch.arange(n_keep, dtype=torch.long, device=dev)
+    new_graph_per_atom = remap[graph_per_atom[atom_mask]]  # [n_keep_atoms]
+
+    # Old atom index → new atom index in filtered batch
+    kept_atoms = atom_mask.nonzero(as_tuple=False).squeeze(1)  # [n_keep_atoms]
+    n_keep_atoms = int(kept_atoms.numel())
+    old_to_new_atom = torch.full((int(batch.num_nodes),), -1, dtype=torch.long, device=dev)
+    old_to_new_atom[kept_atoms] = torch.arange(n_keep_atoms, dtype=torch.long, device=dev)
+
+    # ── Edge-level bookkeeping ──────────────────────────────────────────────
+    # MACE edges are intra-graph, so filtering by source atom is sufficient.
+    src_atoms = batch.edge_index[0]
+    edge_mask = atom_mask[src_atoms]  # [n_edges] bool
+    new_edge_index = old_to_new_atom[batch.edge_index[:, edge_mask]]  # [2, n_keep_edges]
+
+    # ── Build filtered clone ────────────────────────────────────────────────
+    aug = batch.clone()
+    aug.__num_graphs__ = n_keep
+
+    # Atom-level
+    aug.batch = new_graph_per_atom
+    aug.positions = batch.positions[atom_mask]
+    aug.node_attrs = batch.node_attrs[atom_mask]
+
+    # Edge-level
+    aug.edge_index = new_edge_index
+    aug.shifts = batch.shifts[edge_mask]
+    aug.unit_shifts = batch.unit_shifts[edge_mask]
+    for _attr in ("edge_vectors", "edge_lengths"):
+        _v = getattr(batch, _attr, None)
+        if _v is not None:
+            setattr(aug, _attr, _v[edge_mask])
+
+    # Per-atom optional
+    for _attr in ("forces", "charges", "density_coefficients"):
+        _v = getattr(batch, _attr, None)
+        if _v is not None:
+            setattr(aug, _attr, _v[atom_mask])
+
+    # Graph-level scalars [n_graphs] → [n_keep]
+    for _attr in (
+        "head", "weight", "energy",
+        "energy_weight", "forces_weight", "stress_weight", "virials_weight",
+        "dipole_weight", "charges_weight", "polarizability_weight",
+        "elec_temp", "total_charge", "total_spin", "volume", "fermi_level",
+    ):
+        _v = getattr(batch, _attr, None)
+        if _v is not None:
+            setattr(aug, _attr, _v[keep])
+
+    # Graph-level multi-dim tensors [n_graphs, ...] → [n_keep, ...]
+    for _attr in ("stress", "virials", "dipole", "polarizability"):
+        _v = getattr(batch, _attr, None)
+        if _v is not None:
+            setattr(aug, _attr, _v[keep])
+
+    # Cell: stored as [n_graphs*3, 3] (PyG concatenates row-wise)
+    if hasattr(batch, "cell") and batch.cell is not None:
+        aug.cell = torch.cat(
+            [batch.cell[int(g) * 3 : int(g) * 3 + 3] for g in keep.tolist()],
+            dim=0,
+        )
+
+    # Recompute ptr if present
+    if hasattr(batch, "ptr") and batch.ptr is not None:
+        atoms_per_new_graph = torch.zeros(n_keep, dtype=torch.long, device=dev)
+        atoms_per_new_graph.scatter_add_(
+            0, new_graph_per_atom, torch.ones(n_keep_atoms, dtype=torch.long, device=dev)
+        )
+        aug.ptr = torch.cat(
+            [torch.zeros(1, dtype=torch.long, device=dev),
+             torch.cumsum(atoms_per_new_graph, dim=0)]
+        )
+
+    return aug
 
 
 # ---------------------------------------------------------------------------
