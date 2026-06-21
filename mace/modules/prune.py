@@ -95,3 +95,32 @@ class DistillationLoss(nn.Module):
             if F_student is not None:
                 loss = loss + self.w_forces * F.mse_loss(F_student, F_teacher)
         return loss
+
+
+class TaylorImportance:
+    """EMA accumulator of Molchanov first-order Taylor importance: (g * g.grad)^2."""
+
+    def __init__(self, n_layers: int, num_features: int, alpha: float = 0.9) -> None:
+        self.alpha = alpha
+        self.scores = [torch.zeros(num_features) for _ in range(n_layers)]
+        self._initialised = [False] * n_layers
+
+    def update(self, student: nn.Module) -> None:
+        """Call after loss.backward(). Reads gate.g and gate.g.grad."""
+        for i, gate in enumerate(student.channel_gates):
+            if gate.g.grad is None:
+                continue
+            score = (gate.g.detach() * gate.g.grad.detach()) ** 2
+            if not self._initialised[i]:
+                self.scores[i] = score.clone()
+                self._initialised[i] = True
+            else:
+                self.scores[i] = self.alpha * self.scores[i] + (1 - self.alpha) * score
+
+    def rank(self, layer_idx: int) -> torch.Tensor:
+        """Return channel indices sorted ascending (least important first)."""
+        return torch.argsort(self.scores[layer_idx])
+
+    def reset(self) -> None:
+        self.scores = [torch.zeros_like(s) for s in self.scores]
+        self._initialised = [False] * len(self.scores)
