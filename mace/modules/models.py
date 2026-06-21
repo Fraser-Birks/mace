@@ -413,7 +413,7 @@ class MACE(torch.nn.Module):
                 prev_inter = self.interactions[i - 1]
                 prev_gate = self.channel_gates[i - 1]
                 _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
-                    _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
+                    _make_linear_up_gate_hook(prev_gate.g, str(interaction.edge_irreps))
                 )
             try:
                 node_feats, sc = interaction(
@@ -618,7 +618,7 @@ class ScaleShiftMACE(MACE):
                 prev_inter = self.interactions[i - 1]
                 prev_gate = self.channel_gates[i - 1]
                 _linear_up_hook_handle = interaction.linear_up.register_forward_hook(
-                    _make_linear_up_gate_hook(prev_gate.g, str(prev_inter.hidden_irreps))
+                    _make_linear_up_gate_hook(prev_gate.g, str(interaction.edge_irreps))
                 )
             try:
                 node_feats, sc = interaction(

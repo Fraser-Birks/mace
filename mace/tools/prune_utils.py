@@ -39,6 +39,7 @@ class ChannelPruner:
         self.teacher = TeacherWrapper(teacher)
         self.loader = data_loader
         self.config = config
+        self._device = next(iter(teacher.parameters())).device
 
     def run(self) -> nn.Module:
         """Execute the full pruning pipeline and return the pruned model."""
@@ -118,7 +119,8 @@ class ChannelPruner:
         return model
 
     def _infinite_loader(self):
-        """Cycle through the data loader indefinitely."""
+        """Cycle through the data loader indefinitely, moving batches to model device."""
         while True:
             for batch in self.loader:
-                yield batch.to_dict() if hasattr(batch, "to_dict") else batch
+                d = batch.to_dict() if hasattr(batch, "to_dict") else batch
+                yield {k: v.to(self._device) if hasattr(v, "to") else v for k, v in d.items()}
