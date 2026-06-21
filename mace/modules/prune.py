@@ -23,3 +23,26 @@ class ChannelGate(nn.Module):
         with torch.no_grad():
             self.g.zero_()
             self.g[kept_idx] = 1.0
+
+
+def _infer_num_features(model: nn.Module) -> int:
+    """Read num_features (uniform channel multiplicity) from the first interaction block."""
+    return model.interactions[0].hidden_irreps.count(o3.Irrep(0, 1))
+
+
+def make_gated(model: nn.Module) -> nn.Module:
+    """Return a deep copy of model with per-layer ChannelGates attached (all=1.0).
+
+    The returned model is the same class as the input (MACE, ScaleShiftMACE, etc.)
+    and behaves identically until gates are modified.
+    """
+    if getattr(model, "cueq_config", None) is not None:
+        raise NotImplementedError("make_gated does not support cuEquivariance models.")
+    if getattr(model, "oeq_config", None) is not None:
+        raise NotImplementedError("make_gated does not support OpenEquivariance models.")
+    student = copy.deepcopy(model)
+    num_features = _infer_num_features(student)
+    student.channel_gates = nn.ModuleList(
+        [ChannelGate(num_features) for _ in student.interactions]
+    )
+    return student
