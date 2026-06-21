@@ -1009,7 +1009,7 @@ def run(args) -> None:
 
         _n_student_heads = len(heads)
         if _n_student_heads > 1:
-            _head_names = ", ".join(heads.keys())
+            _head_names = ", ".join(heads)
             logging.info(
                 f"[Distillation] Multihead fine-tuning detected ({_n_student_heads} heads: "
                 f"{_head_names}). Student distils from ALL heads via EMA teacher "
