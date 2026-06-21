@@ -46,7 +46,7 @@ from .models import (
     ScaleShiftMACE,
 )
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
-from .prune import ChannelGate, DistillationLoss, TaylorImportance, TeacherWrapper, _infer_num_features, make_gated
+from .prune import ChannelGate, CubicPruningSchedule, DistillationLoss, TaylorImportance, TeacherWrapper, _infer_num_features, make_gated
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
     compute_avg_num_neighbors,
@@ -136,4 +136,5 @@ __all__ = [
     "TeacherWrapper",
     "DistillationLoss",
     "TaylorImportance",
+    "CubicPruningSchedule",
 ]

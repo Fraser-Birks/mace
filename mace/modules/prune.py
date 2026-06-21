@@ -124,3 +124,36 @@ class TaylorImportance:
     def reset(self) -> None:
         self.scores = [torch.zeros_like(s) for s in self.scores]
         self._initialised = [False] * len(self.scores)
+
+
+class CubicPruningSchedule:
+    """Zhu & Gupta cubic sparsity schedule.
+
+    s_t = s_f * (1 - ((t - t0) / (n * dt))^3)
+    kept_count_t = round(n_total * (1 - s_t))
+    """
+
+    def __init__(
+        self,
+        n_total: int,
+        target_channels: int,
+        start_step: int,
+        n_steps: int,
+        dt: int,
+    ) -> None:
+        self.n_total = n_total
+        self.target = target_channels
+        self.t0 = start_step
+        self.n_steps = n_steps
+        self.dt = dt
+        self.s_f = 1.0 - target_channels / n_total
+
+    def kept_count(self, step: int) -> int:
+        if step <= self.t0:
+            return self.n_total
+        end = self.t0 + self.n_steps * self.dt
+        if step >= end:
+            return self.target
+        progress = (step - self.t0) / (self.n_steps * self.dt)
+        s_t = self.s_f * (1.0 - (1.0 - progress) ** 3)
+        return max(self.target, round(self.n_total * (1.0 - s_t)))
