@@ -1,6 +1,5 @@
 """ChannelPruner: orchestrates gradual pruning using prune.py components."""
 import dataclasses
-from typing import Optional
 
 import torch
 import torch.nn as nn
