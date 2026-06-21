@@ -46,6 +46,7 @@ from .models import (
     ScaleShiftMACE,
 )
 from .radial import BesselBasis, GaussianBasis, PolynomialCutoff, ZBLBasis
+from .prune import ChannelGate
 from .symmetric_contraction import SymmetricContraction
 from .utils import (
     compute_avg_num_neighbors,
@@ -129,4 +130,5 @@ __all__ = [
     "compute_fixed_charge_dipole",
     "compute_fixed_charge_dipole_polar",
     "compute_dielectric_gradients",
+    "ChannelGate",
 ]
