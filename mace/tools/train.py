@@ -632,6 +632,7 @@ def train_one_epoch(
                             f"s_bwd+step={opt_metrics['_dbg_t_s_bwd_ms']:.0f}ms "
                             f"| E_loss={opt_metrics.get('distill_energy', 0):.5f} "
                             f"F_loss={opt_metrics.get('distill_forces', 0):.5f} "
+                            f"| aug_graphs={opt_metrics['_dbg_n_aug_graphs']} "
                             f"| step_total={opt_metrics['time']*1000:.0f}ms"
                         )
                     else:
