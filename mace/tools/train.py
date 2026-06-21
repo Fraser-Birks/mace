@@ -622,17 +622,26 @@ def train_one_epoch(
                             f"[Distill DEBUG E{epoch} step 0 aug] {stats}"
                         )
                     # Per-step timing one-liner
-                    logging.info(
-                        f"[Distill DEBUG E{epoch} step {_step_idx}] "
-                        f"dft={opt_metrics['_dbg_t_teacher_ms']:.0f}ms "
-                        f"rattle={opt_metrics['_dbg_t_rattle_ms']:.0f}ms "
-                        f"ema_fwd={opt_metrics['_dbg_t_ema_fwd_ms']:.0f}ms "
-                        f"s_fwd={opt_metrics['_dbg_t_s_fwd_ms']:.0f}ms "
-                        f"s_bwd+step={opt_metrics['_dbg_t_s_bwd_ms']:.0f}ms "
-                        f"| E_loss={opt_metrics.get('distill_energy', 0):.5f} "
-                        f"F_loss={opt_metrics.get('distill_forces', 0):.5f} "
-                        f"| step_total={opt_metrics['time']*1000:.0f}ms"
-                    )
+                    if "_dbg_t_ema_fwd_ms" in opt_metrics:
+                        logging.info(
+                            f"[Distill DEBUG E{epoch} step {_step_idx}] "
+                            f"dft={opt_metrics['_dbg_t_teacher_ms']:.0f}ms "
+                            f"rattle={opt_metrics['_dbg_t_rattle_ms']:.0f}ms "
+                            f"ema_fwd={opt_metrics['_dbg_t_ema_fwd_ms']:.0f}ms "
+                            f"s_fwd={opt_metrics['_dbg_t_s_fwd_ms']:.0f}ms "
+                            f"s_bwd+step={opt_metrics['_dbg_t_s_bwd_ms']:.0f}ms "
+                            f"| E_loss={opt_metrics.get('distill_energy', 0):.5f} "
+                            f"F_loss={opt_metrics.get('distill_forces', 0):.5f} "
+                            f"| step_total={opt_metrics['time']*1000:.0f}ms"
+                        )
+                    else:
+                        # Batch was all non-target head (pt_head): student step skipped
+                        logging.info(
+                            f"[Distill DEBUG E{epoch} step {_step_idx}] "
+                            f"dft={opt_metrics.get('_dbg_t_teacher_ms', 0):.0f}ms "
+                            f"[student skipped — non-target batch] "
+                            f"| step_total={opt_metrics['time']*1000:.0f}ms"
+                        )
                     # Snapshot before keys are stripped below
                     _dbg_step_data.append(dict(opt_metrics))
                 elif "_dbg_t_teacher_ms" in opt_metrics:
